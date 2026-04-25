@@ -5,4 +5,3 @@ pydantic==2.8.2
 python-dotenv==1.0.1
 faster-whisper==1.1.0
 requests==2.32.3
-redis[asyncio]>=5.0.0

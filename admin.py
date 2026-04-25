@@ -4,6 +4,7 @@ admin.py  —  Internal admin endpoints + GUI for ConnectCircuits API
 API routes:   POST/GET/DELETE /admin/keys
               GET /admin/usage
               GET /admin/usage/summary
+              GET /admin/jobs
 GUI route:    GET /admin/ui
 
 Protect /admin/* behind a reverse-proxy allow-list or VPN in production.
@@ -113,6 +114,41 @@ def admin_usage_summary(_=Depends(_require_admin)):
         GROUP BY k.user_label, k.tier, u.endpoint, u.status
         ORDER BY k.user_label, u.endpoint
     """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@router.get("/jobs")
+def admin_jobs(
+    status: Optional[str] = None,
+    user_label: Optional[str] = None,
+    limit: int = 50,
+    _=Depends(_require_admin),
+):
+    """List recent jobs with optional filters."""
+    conn = _get_db()
+    conditions = []
+    params = []
+
+    if status:
+        conditions.append("j.status = ?")
+        params.append(status)
+    if user_label:
+        conditions.append("k.user_label = ?")
+        params.append(user_label)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+
+    rows = conn.execute(f"""
+        SELECT j.job_id, j.endpoint, j.status, j.created_at, j.started_at,
+               j.completed_at, j.error, k.user_label, k.tier
+        FROM jobs j
+        LEFT JOIN api_keys k ON j.user_key_hash = k.key_hash
+        {where}
+        ORDER BY j.created_at DESC
+        LIMIT ?
+    """, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 

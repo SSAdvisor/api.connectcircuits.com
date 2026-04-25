@@ -1,5 +1,6 @@
-services:
+version: "3.8"
 
+services:
   # ── Kokoro TTS (internal only) ────────────────────────────────────────────
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
@@ -9,17 +10,6 @@ services:
       - tapinet
     environment:
       - PYTHONUNBUFFERED=1
-
-  # ── Redis — job state & concurrency counters ──────────────────────────────
-  redis:
-    image: redis:7-alpine
-    container_name: tapi_redis
-    restart: unless-stopped
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    networks:
-      - tapinet
-    volumes:
-      - redis_data:/data
 
   # ── ConnectCircuits TTS/media API ─────────────────────────────────────────
   tts-api:
@@ -32,7 +22,6 @@ services:
       - tapinet
     depends_on:
       - kokoro
-      - redis
     ports:
       - "8800:8000"
     volumes:
@@ -44,10 +33,8 @@ services:
       # --- Auth ---
       - CONNECTCIRCUITS_API_KEY=${CONNECTCIRCUITS_API_KEY}
       - ADMIN_SECRET=${ADMIN_SECRET}
-      # --- Redis ---
-      - REDIS_URL=redis://redis:6379/0
-      # --- Storage paths ---
-      - KEYS_DB_PATH=/app/data/api_keys.db
+      # --- Database ---
+      - DB_PATH=/app/data/store.db
       - RESULTS_DIR=/app/data/results
       - RESULT_TTL_SEC=${RESULT_TTL_SEC:-21600}
       - JOB_TTL_SEC=${JOB_TTL_SEC:-21600}
@@ -67,5 +54,4 @@ networks:
     driver: bridge
 
 volumes:
-  redis_data:
   api_data:

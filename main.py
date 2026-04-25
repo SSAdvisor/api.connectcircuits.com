@@ -1,6 +1,5 @@
 import os
 import uuid
-import hmac
 import asyncio
 import hashlib
 import tempfile
@@ -21,14 +20,14 @@ from store import (
     update_usage_status,
     _get_db,
     load_result as _load_result,
-)
-from jobs import (
     create_job,
     get_job,
-    run_job,
+    get_job_by_user,
     check_user_concurrency,
+)
+from jobs import (
+    run_job,
     periodic_cleanup,
-    close_redis,
 )
 from admin import router as admin_router
 from helpers import (
@@ -75,22 +74,17 @@ COLOR_MAP = {
 
 
 # -------------------------------------------------------
-# Startup / Shutdown
+# Startup
 # -------------------------------------------------------
 
 @app.on_event("startup")
 async def startup():
+    # Triggers _ensure_schema() which creates the jobs table
     conn = _get_db()
     conn.close()
     logger.info("DB initialized. API ready.")
     asyncio.create_task(periodic_cleanup(interval_sec=3600))
     logger.info("Background cleanup task started.")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await close_redis()
-    logger.info("Shutdown complete.")
 
 
 # -------------------------------------------------------
@@ -159,18 +153,31 @@ def _job_response(job_id: str, webhook_url: Optional[str]) -> dict:
     }
 
 
+async def _guard_concurrency(raw_key: str, endpoint: str):
+    key_hash = _hash_key(raw_key)
+    if not check_user_concurrency(key_hash):
+        raise HTTPException(
+            status_code=429,
+            detail="Concurrency limit reached. Wait for existing jobs to complete before submitting more.",
+            headers={"Retry-After": "30"},
+        )
+    return key_hash
+
+
 # -------------------------------------------------------
 # Job status + result endpoints
 # -------------------------------------------------------
 
 @app.get("/v1/jobs/{job_id}")
 async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found or expired.")
     key_hash = _hash_key(raw_key)
-    if job.get("user_key_hash") != key_hash:
-        raise HTTPException(status_code=403, detail="Access denied.")
+    job = get_job_by_user(job_id, key_hash)
+    if not job:
+        # Check if job exists at all (wrong user) vs not found
+        any_job = get_job(job_id)
+        if any_job:
+            raise HTTPException(status_code=403, detail="Access denied.")
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
     return {
         "job_id":       job["job_id"],
         "endpoint":     job["endpoint"],
@@ -185,12 +192,13 @@ async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
 
 @app.get("/v1/jobs/{job_id}/result")
 async def job_result(job_id: str, raw_key: str = Security(verify_api_key)):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found or expired.")
     key_hash = _hash_key(raw_key)
-    if job.get("user_key_hash") != key_hash:
-        raise HTTPException(status_code=403, detail="Access denied.")
+    job = get_job_by_user(job_id, key_hash)
+    if not job:
+        any_job = get_job(job_id)
+        if any_job:
+            raise HTTPException(status_code=403, detail="Access denied.")
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
     if job["status"] != "complete":
         raise HTTPException(
             status_code=409,
@@ -287,31 +295,21 @@ class SlideshowRequest(AsyncBase):
 
 
 # -------------------------------------------------------
-# Concurrency guard helper
-# -------------------------------------------------------
-
-async def _guard_concurrency(raw_key: str, endpoint: str):
-    key_hash = _hash_key(raw_key)
-    if not await check_user_concurrency(key_hash):
-        raise HTTPException(
-            status_code=429,
-            detail="Concurrency limit reached. Wait for existing jobs to complete before submitting more.",
-            headers={"Retry-After": "30"},
-        )
-    return key_hash
-
-
-# -------------------------------------------------------
 # Health
 # -------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    from jobs import check_redis_health
-    redis_ok = await check_redis_health()
+    try:
+        conn = _get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        db_ok = True
+    except Exception:
+        db_ok = False
     return {
-        "status":              "ok" if redis_ok else "degraded",
-        "redis":               "connected" if redis_ok else "unreachable",
+        "status":              "ok" if db_ok else "degraded",
+        "database":            "connected" if db_ok else "error",
         "tts_backend":         KOKORO_BASE_URL,
         "flux_provider":       FLUX_PROVIDER,
         "fal_configured":      bool(FAL_API_KEY),
@@ -387,7 +385,7 @@ async def generate_audio(request: AudioGenerateRequest, raw_key: str = Security(
             except OSError:
                 pass
 
-    job_id = await create_job("/v1/generate/audio", key_hash, request.webhook_url, request.dict())
+    job_id = create_job("/v1/generate/audio", key_hash, request.webhook_url, request.dict())
     asyncio.create_task(run_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/audio", task_fn=_task,
@@ -454,7 +452,7 @@ async def generate_image(request: ImageGenerateRequest, raw_key: str = Security(
                 last_error = f"{p}: {e}"
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 
-    job_id = await create_job("/v1/generate/image", key_hash, request.webhook_url, request.dict())
+    job_id = create_job("/v1/generate/image", key_hash, request.webhook_url, request.dict())
     asyncio.create_task(run_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/image", task_fn=_task,
@@ -554,7 +552,7 @@ async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(
             except OSError:
                 pass
 
-    job_id = await create_job("/v1/generate/slideshow", key_hash, request.webhook_url, {"slide_count": len(request.slides)})
+    job_id = create_job("/v1/generate/slideshow", key_hash, request.webhook_url, {"slide_count": len(request.slides)})
     asyncio.create_task(run_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/slideshow", task_fn=_task,
@@ -680,7 +678,7 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
             except OSError:
                 pass
 
-    job_id = await create_job("/v1/generate/video", key_hash, request.webhook_url, {"video_url": request.video_url})
+    job_id = create_job("/v1/generate/video", key_hash, request.webhook_url, {"video_url": request.video_url})
     asyncio.create_task(run_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video", task_fn=_task,
@@ -803,7 +801,7 @@ async def generate_video_captions(request: VideoCaptionRequest, raw_key: str = S
             except OSError:
                 pass
 
-    job_id = await create_job("/v1/generate/video/captions", key_hash, request.webhook_url, {"video_url": request.video_url})
+    job_id = create_job("/v1/generate/video/captions", key_hash, request.webhook_url, {"video_url": request.video_url})
     asyncio.create_task(run_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video/captions", task_fn=_task,
