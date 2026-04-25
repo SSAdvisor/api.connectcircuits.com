@@ -3,17 +3,21 @@ import asyncio
 import subprocess
 import base64
 import os
+import threading
 import httpx
 from faster_whisper import WhisperModel
 
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 _whisper_model = None
+_whisper_lock = threading.Lock()
 
 
-def get_whisper_model():
+def get_whisper_model() -> WhisperModel:
     global _whisper_model
     if _whisper_model is None:
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        with _whisper_lock:
+            if _whisper_model is None:
+                _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -136,6 +140,37 @@ def probe_audio_duration(audio_path: str) -> float:
         return 0.0
 
 
+async def async_probe_audio_duration(audio_path: str) -> float:
+    """Async wrapper around ffprobe for audio duration."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        return float(stdout.decode().strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+async def async_probe_video_dimensions(video_path: str) -> tuple:
+    """Async wrapper around ffprobe for video dimensions."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "csv=p=0", video_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    try:
+        parts = stdout.decode().strip().split(",")
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError, AttributeError):
+        return 640, 360
+
+
 def build_timed_segments_from_audio_chunks(caption_text, chunk_audio_paths, words_per_caption=12):
     text_chunks = chunk_text(caption_text)
     if len(text_chunks) != len(chunk_audio_paths):
@@ -213,7 +248,7 @@ def probe_video_dimensions(video_path: str) -> tuple:
 
 
 # -------------------------------------------------------
-# Overlay caption filtergraph (for /v1/generate/video endpoints)
+# Overlay caption filtergraph
 # -------------------------------------------------------
 
 CHAR_WIDTH_RATIO = 0.55
@@ -383,288 +418,4 @@ async def generate_image_fal(api_key, prompt, width, height, steps=4, seed=None)
     async with httpx.AsyncClient(timeout=120.0) as client:
         r = await client.post(
             url, json=payload,
-            headers={"Authorization": f"Key {api_key}", "Content-Type": "application/json"},
-        )
-        if r.status_code >= 400:
-            raise RuntimeError(f"fal.ai HTTP {r.status_code}: {r.text[:400]}")
-        data = r.json()
-
-    images = data.get("images") or []
-    if not images:
-        raise RuntimeError(f"fal.ai returned no images: {data}")
-
-    first   = images[0]
-    img_url = first.get("url") if isinstance(first, dict) else first
-    if not img_url:
-        raise RuntimeError(f"fal.ai image entry missing url: {first}")
-
-    if img_url.startswith("data:"):
-        return _decode_data_uri(img_url)
-    return await _fetch_image_bytes(img_url)
-
-
-async def generate_image_together(api_key, prompt, width, height, steps=4, seed=None):
-    url = "https://api.together.xyz/v1/images/generations"
-    payload = {
-        "model":  "black-forest-labs/FLUX.1-schnell-Free",
-        "prompt": prompt,
-        "width":  width,
-        "height": height,
-        "steps":  steps,
-        "n": 1,
-        "response_format": "b64_json",
-    }
-    if seed is not None:
-        payload["seed"] = seed
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(
-            url, json=payload,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        )
-        if r.status_code >= 400:
-            raise RuntimeError(f"Together.ai HTTP {r.status_code}: {r.text[:400]}")
-        data = r.json()
-
-    entries = data.get("data") or []
-    if not entries:
-        raise RuntimeError(f"Together.ai returned no data: {data}")
-
-    entry = entries[0]
-    if "b64_json" in entry and entry["b64_json"]:
-        return base64.b64decode(entry["b64_json"]), "image/png"
-    if "url" in entry and entry["url"]:
-        return await _fetch_image_bytes(entry["url"])
-
-    raise RuntimeError(f"Together.ai entry missing image data: {entry}")
-
-
-# -------------------------------------------------------
-# Slideshow: word-by-word caption filtergraph
-# -------------------------------------------------------
-
-def build_slideshow_caption_filtergraph(
-    text: str,
-    audio_dur: float,
-    pad_start: float,
-    font_size: int,
-    font_color: str,
-    caption_position: str,
-    out_w: int,
-    out_h: int,
-    words_per_caption: int,
-) -> str:
-    """
-    Build a drawtext filtergraph that cycles caption groups word-by-word
-    across the slide duration. Each group of words_per_caption words is
-    shown for an equal slice of the audio duration, offset by pad_start.
-
-    caption_position: "top" | "center" | "bottom"
-    """
-
-    def esc(s):
-        return (
-            s.replace("\\", "\\\\")
-             .replace("'", "\u2019")
-             .replace(":", "\\:")
-             .replace(",", "\\,")
-             .replace("[", "\\[")
-             .replace("]", "\\]")
-        )
-
-    font_path    = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-    shadow_color = "black@0.8"
-    words        = text.split()
-    n_words      = len(words)
-
-    if n_words == 0:
-        return "null"
-
-    # Group words into display chunks
-    groups = []
-    for i in range(0, n_words, words_per_caption):
-        groups.append(" ".join(words[i:i + words_per_caption]))
-
-    n_groups       = len(groups)
-    time_per_group = audio_dur / n_groups if n_groups > 0 else audio_dur
-
-    # Vertical position based on caption_position
-    margin = int(out_h * 0.08)   # 8% from edge
-    line_h = int(font_size * 1.35)
-
-    if caption_position == "top":
-        y_expr = str(margin)
-    elif caption_position == "center":
-        y_expr = f"(h-text_h)/2"
-    else:  # bottom (default)
-        y_expr = f"h-text_h-{margin}"
-
-    parts = []
-    for gi, group_text in enumerate(groups):
-        t_start = pad_start + gi * time_per_group
-        t_end   = pad_start + (gi + 1) * time_per_group
-        enable  = f"between(t\\,{t_start:.3f}\\,{t_end:.3f})"
-        escaped = esc(group_text)
-
-        # Shadow layer (offset 3px) for readability over any background
-        parts.append(
-            f"drawtext=text='{escaped}':"
-            f"fontfile='{font_path}':"
-            f"fontsize={font_size}:"
-            f"fontcolor={shadow_color}:"
-            f"x=(w-text_w)/2+3:y={y_expr}+3:"
-            f"enable='{enable}'"
-        )
-        # Main text layer
-        parts.append(
-            f"drawtext=text='{escaped}':"
-            f"fontfile='{font_path}':"
-            f"fontsize={font_size}:"
-            f"fontcolor={font_color}:"
-            f"x=(w-text_w)/2:y={y_expr}:"
-            f"enable='{enable}'"
-        )
-
-    return ",\n".join(parts)
-
-
-# -------------------------------------------------------
-# Slideshow: per-slide segment builder
-# -------------------------------------------------------
-
-async def _tts_bytes(kokoro_base_url: str, text: str, voice: str, speed: float) -> bytes:
-    payload = {
-        "model": "kokoro",
-        "input": text,
-        "voice": voice,
-        "speed": speed,
-        "response_format": "mp3",
-    }
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(
-            f"{kokoro_base_url}/v1/audio/speech",
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        r.raise_for_status()
-        return r.content
-
-
-async def build_slide_segment(
-    slide,
-    index: int,
-    tmp_dir: str,
-    kokoro_base_url: str,
-    voice: str,
-    speed: float,
-    font_size: int,
-    font_color: str,
-    caption_position: str,      # "top" | "center" | "bottom" | None
-    words_per_caption: int,
-    pad_start: float,
-    pad_end: float,
-    out_w: int = 720,
-    out_h: int = 1280,
-) -> tuple:
-    """
-    Build one slide MP4 segment.
-
-    Output resolution defaults to 720x1280 (YouTube Shorts / 9:16).
-    All source images are scaled/letterboxed to out_w x out_h.
-
-    caption_position=None → no caption rendered (clean slide).
-    caption_position="bottom"|"center"|"top" → word-group captions at that position.
-
-    Returns (segment_mp4_path, list_of_tmp_files_to_cleanup).
-    """
-    prefix      = f"slide_{index:04d}"
-    img_path    = os.path.join(tmp_dir, f"{prefix}_img")
-    audio_path  = os.path.join(tmp_dir, f"{prefix}_audio.mp3")
-    padded_audio= os.path.join(tmp_dir, f"{prefix}_padded.mp3")
-    seg_path    = os.path.join(tmp_dir, f"{prefix}_seg.mp4")
-    tmp_files   = [img_path, audio_path, padded_audio]
-
-    # 1. Download image + generate TTS concurrently
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        img_resp, audio_bytes = await asyncio.gather(
-            client.get(slide.image_url),
-            _tts_bytes(kokoro_base_url, slide.text, voice, speed),
-        )
-    img_resp.raise_for_status()
-
-    ctype    = img_resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-    ext      = "png" if "png" in ctype else "webp" if "webp" in ctype else "jpg"
-    img_path += f".{ext}"
-    tmp_files[0] = img_path
-
-    with open(img_path, "wb") as f:
-        f.write(img_resp.content)
-    with open(audio_path, "wb") as f:
-        f.write(audio_bytes)
-
-    # 2. Probe TTS duration → total slide duration
-    audio_dur      = probe_audio_duration(audio_path)
-    if audio_dur <= 0:
-        raise RuntimeError(f"Slide {index}: could not determine TTS audio duration.")
-    slide_duration = pad_start + audio_dur + pad_end
-
-    # 3. Build padded audio: silence(pad_start) + tts + silence(pad_end)
-    pad_start_ms = int(pad_start * 1000)
-    pad_cmd = [
-        "ffmpeg", "-y",
-        "-i", audio_path,
-        "-af", f"adelay={pad_start_ms}|{pad_start_ms},apad=pad_dur={pad_end:.3f}",
-        "-t", f"{slide_duration:.3f}",
-        padded_audio,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *pad_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"Slide {index} audio pad error: {stderr.decode()[:300]}")
-
-    # 4. Build scale/pad filter to out_w x out_h (letterbox/pillarbox)
-    scale_pad_vf = (
-        f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
-        f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black"
-    )
-
-    # 5. Optionally build caption filter (uses out_w/out_h — post-scale dimensions)
-    if caption_position and caption_position.lower() in ("top", "center", "bottom"):
-        caption_vf = build_slideshow_caption_filtergraph(
-            text=slide.text,
-            audio_dur=audio_dur,
-            pad_start=pad_start,
-            font_size=font_size,
-            font_color=font_color,
-            caption_position=caption_position.lower(),
-            out_w=out_w,
-            out_h=out_h,
-            words_per_caption=words_per_caption,
-        )
-        full_vf = f"{scale_pad_vf},{caption_vf}"
-    else:
-        full_vf = scale_pad_vf
-
-    # 6. Compose: static image → scale/pad → optional captions → mux audio
-    compose_cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-framerate", "25", "-i", img_path,
-        "-i", padded_audio,
-        "-vf", full_vf,
-        "-map", "0:v", "-map", "1:a",
-        "-c:v", "libx264", "-crf", "23", "-preset", "fast",
-        "-c:a", "aac", "-b:a", "128k",
-        "-t", f"{slide_duration:.3f}",
-        "-pix_fmt", "yuv420p",
-        seg_path,
-    ]
-    proc2 = await asyncio.create_subprocess_exec(
-        *compose_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr2 = await proc2.communicate()
-    if proc2.returncode != 0:
-        raise RuntimeError(f"Slide {index} compose error: {stderr2.decode()[:400]}")
-
-    return seg_path, tmp_files
+            headers={"Authorization": f"Key {api_key}", "Content

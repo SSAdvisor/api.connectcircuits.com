@@ -15,12 +15,14 @@ import time
 import json
 import asyncio
 import logging
+import ipaddress
+from urllib.parse import urlparse
 from typing import Optional, Callable, Awaitable, Any
 
 import httpx
 import redis.asyncio as aioredis
 
-from store import save_result, log_usage
+from store import save_result, log_usage, cleanup_expired_results, cleanup_old_usage_logs
 
 logger = logging.getLogger("jobs")
 
@@ -41,8 +43,72 @@ _redis: Optional[aioredis.Redis] = None
 async def get_redis() -> aioredis.Redis:
     global _redis
     if _redis is None:
-        _redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        _redis = await aioredis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            max_connections=20,
+            socket_connect_timeout=5,
+            socket_keepalive=True,
+        )
     return _redis
+
+
+async def close_redis() -> None:
+    """Close the Redis connection pool. Call on application shutdown."""
+    global _redis
+    if _redis is not None:
+        await _redis.close()
+        _redis = None
+        logger.info("Redis connection closed.")
+
+
+def is_safe_webhook_url(url: str) -> bool:
+    """Validate webhook URL to prevent SSRF attacks.
+    Rejects private/internal IPs and non-HTTP(S) schemes."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return False
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_reserved or ip.is_loopback or ip.is_link_local:
+                return False
+        except ValueError:
+            # hostname is a domain name, not an IP — allow it
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def check_redis_health() -> bool:
+    """Returns True if Redis is reachable and responsive."""
+    try:
+        r = await get_redis()
+        result = await r.ping()
+        return result is True
+    except Exception:
+        return False
+
+
+async def periodic_cleanup(interval_sec: int = 3600):
+    """Run cleanup tasks periodically. Spawn as a background task."""
+    while True:
+        try:
+            removed = cleanup_expired_results()
+            if removed > 0:
+                logger.info(f"Cleanup: removed {removed} expired result files.")
+            logs_deleted = cleanup_old_usage_logs(days=30)
+            if logs_deleted > 0:
+                logger.info(f"Cleanup: removed {logs_deleted} old usage log entries.")
+        except Exception as e:
+            logger.exception(f"Cleanup task error: {e}")
+        await asyncio.sleep(interval_sec)
 
 
 # -------------------------------------------------------
@@ -67,6 +133,9 @@ async def create_job(
     request_payload: dict,
 ) -> str:
     """Create a PENDING job in Redis. Returns job_id."""
+    if webhook_url and not is_safe_webhook_url(webhook_url):
+        raise ValueError(f"Invalid webhook URL: {webhook_url}")
+
     r       = await get_redis()
     job_id  = str(uuid.uuid4())
     now     = int(time.time())
@@ -114,7 +183,7 @@ async def _update_job(job_id: str, **fields):
 async def _decrement_user_active(user_key_hash: str):
     r   = await get_redis()
     val = await r.decr(_user_active_key(user_key_hash))
-    if val < 0:
+    if int(val) < 0:
         await r.set(_user_active_key(user_key_hash), 0)
 
 
@@ -139,6 +208,10 @@ async def check_user_concurrency(user_key_hash: str) -> bool:
 # -------------------------------------------------------
 
 async def _fire_webhook(job_id: str, webhook_url: str, payload: dict):
+    if not is_safe_webhook_url(webhook_url):
+        logger.error(f"Webhook URL validation failed for job={job_id}: {webhook_url}")
+        return
+
     for attempt in range(1, WEBHOOK_RETRIES + 1):
         try:
             async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
@@ -150,7 +223,7 @@ async def _fire_webhook(job_id: str, webhook_url: str, payload: dict):
         except Exception as e:
             logger.warning(f"Webhook job={job_id} attempt={attempt} error: {e}")
         if attempt < WEBHOOK_RETRIES:
-            await asyncio.sleep(2 ** attempt)   # exponential back-off: 2s, 4s
+            await asyncio.sleep(2 ** attempt)
 
     logger.error(f"Webhook FAILED for job={job_id} after {WEBHOOK_RETRIES} attempts")
 

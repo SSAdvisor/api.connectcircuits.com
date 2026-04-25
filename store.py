@@ -14,17 +14,20 @@ import hashlib
 import secrets
 import sqlite3
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
 DB_PATH = Path(os.getenv("DB_PATH", "/app/data/store.db"))
+RESULTS_DIR = Path(os.getenv("RESULTS_DIR", "/app/data/results"))
+RESULT_TTL_SEC = int(os.getenv("RESULT_TTL_SEC", str(60 * 60 * 6)))
 
 
 def _get_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row          # always return named-column rows
-    conn.execute("PRAGMA journal_mode=WAL") # safe for concurrent reads
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _ensure_schema(conn)
     return conn
@@ -61,6 +64,82 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 def _hash_key(raw_key: str) -> str:
     """SHA-256 hex digest — used identically at creation and verification."""
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
+# ── Result Storage ─────────────────────────────────────────────────────────────
+
+def save_result(job_id: str, data: bytes, content_type: str, filename: str) -> None:
+    """Save a job result to disk."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    ext_map = {
+        "video/mp4": ".mp4",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "audio/opus": ".opus",
+        "audio/flac": ".flac",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+    }
+    ext = ext_map.get(content_type, ".bin")
+    result_path = RESULTS_DIR / f"{job_id}{ext}"
+    with open(result_path, "wb") as f:
+        f.write(data)
+
+
+def load_result(job_id: str):
+    """Load a completed job result from disk.
+    Returns (bytes, content_type, filename) or None if not found."""
+    import glob
+    pattern = str(RESULTS_DIR / f"{job_id}.*")
+    matches = glob.glob(pattern)
+    if not matches:
+        return None
+    result_path = matches[0]
+    ext = os.path.splitext(result_path)[1].lower()
+    mime_map = {
+        ".mp4":  ("video/mp4",   "output.mp4"),
+        ".mp3":  ("audio/mpeg",  "audio.mp3"),
+        ".wav":  ("audio/wav",   "audio.wav"),
+        ".opus": ("audio/opus",  "audio.opus"),
+        ".flac": ("audio/flac",  "audio.flac"),
+        ".png":  ("image/png",   "image.png"),
+        ".jpg":  ("image/jpeg",  "image.jpg"),
+        ".jpeg": ("image/jpeg",  "image.jpg"),
+    }
+    content_type, filename = mime_map.get(ext, ("application/octet-stream", f"result{ext}"))
+    with open(result_path, "rb") as f:
+        return f.read(), content_type, filename
+
+
+def cleanup_expired_results() -> int:
+    """Remove result files older than RESULT_TTL_SEC. Returns count removed."""
+    if not RESULTS_DIR.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for f in RESULTS_DIR.iterdir():
+        if f.is_file():
+            age = now - f.stat().st_mtime
+            if age > RESULT_TTL_SEC:
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
+def cleanup_old_usage_logs(days: int = 30) -> int:
+    """Delete usage_log entries older than N days. Returns count removed."""
+    conn = _get_db()
+    cursor = conn.execute(
+        "DELETE FROM usage_log WHERE ts < datetime('now', ?)",
+        (f"-{days} days",)
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
 
 
 # ── Key Management ─────────────────────────────────────────────────────────────
@@ -143,6 +222,8 @@ def log_usage(
     Record a single API request.  key_hash may be None for unauthenticated
     requests that were rejected (so we still count 401s).
     """
+    if raw_key and not isinstance(raw_key, str):
+        return
     key_hash = _hash_key(raw_key) if raw_key else None
     conn = _get_db()
     conn.execute(

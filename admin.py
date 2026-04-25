@@ -10,6 +10,7 @@ Protect /admin/* behind a reverse-proxy allow-list or VPN in production.
 """
 
 import os
+import hmac
 import pathlib
 from fastapi import APIRouter, HTTPException, Header, Depends
 from fastapi.responses import HTMLResponse
@@ -33,7 +34,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 def _require_admin(x_admin_secret: str = Header(...)):
     if not ADMIN_SECRET:
         raise HTTPException(status_code=500, detail="ADMIN_SECRET not configured.")
-    if x_admin_secret != ADMIN_SECRET:
+    if not hmac.compare_digest(x_admin_secret.encode(), ADMIN_SECRET.encode()):
         raise HTTPException(status_code=403, detail="Forbidden.")
     return True
 
@@ -61,7 +62,13 @@ def admin_create_key(req: CreateKeyRequest, _=Depends(_require_admin)):
 
 @router.get("/keys")
 def admin_list_keys(_=Depends(_require_admin)):
-    return list_api_keys()
+    keys = list_api_keys()
+    redacted = []
+    for k in keys:
+        entry = dict(k)
+        entry.pop("key_hash", None)
+        redacted.append(entry)
+    return redacted
 
 
 @router.delete("/keys")
@@ -115,7 +122,6 @@ def admin_ui():
     """
     Serves the admin panel HTML from admin_ui.html.
     __API_BASE__ tokens are replaced at request time with PUBLIC_BASE_URL.
-    Plain string replace — no f-strings, no brace escaping needed.
     """
     html_path = pathlib.Path(__file__).parent / "admin_ui.html"
     html = html_path.read_text(encoding="utf-8")

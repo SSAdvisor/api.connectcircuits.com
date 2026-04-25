@@ -1,5 +1,6 @@
 import os
 import uuid
+import hmac
 import asyncio
 import hashlib
 import tempfile
@@ -13,12 +14,21 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from dotenv import load_dotenv
 
-from store import verify_api_key as _db_verify_api_key, _hash_key, log_usage, update_usage_status, _get_db
+from store import (
+    verify_api_key as _db_verify_api_key,
+    _hash_key,
+    log_usage,
+    update_usage_status,
+    _get_db,
+    load_result as _load_result,
+)
 from jobs import (
     create_job,
     get_job,
     run_job,
     check_user_concurrency,
+    periodic_cleanup,
+    close_redis,
 )
 from admin import router as admin_router
 from helpers import (
@@ -65,17 +75,22 @@ COLOR_MAP = {
 
 
 # -------------------------------------------------------
-# Startup — initialize DB schema
+# Startup / Shutdown
 # -------------------------------------------------------
 
 @app.on_event("startup")
 async def startup():
-    # _get_db() calls _ensure_schema() internally on every connection.
-    # Opening and closing one connection at startup guarantees the schema
-    # and WAL journal mode are set before the first request arrives.
     conn = _get_db()
     conn.close()
     logger.info("DB initialized. API ready.")
+    asyncio.create_task(periodic_cleanup(interval_sec=3600))
+    logger.info("Background cleanup task started.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await close_redis()
+    logger.info("Shutdown complete.")
 
 
 # -------------------------------------------------------
@@ -89,39 +104,6 @@ def verify_api_key(raw_key: str = Security(api_key_header)):
     if not row:
         raise HTTPException(status_code=401, detail="Invalid or revoked API key.")
     return raw_key
-
-
-# -------------------------------------------------------
-# Result loader (reads from disk, replaces old load_result)
-# -------------------------------------------------------
-
-def _load_result(job_id: str):
-    """
-    Load a completed job result from disk.
-    Returns (bytes, content_type, filename) or None if not found.
-    Mirrors the contract of the old store.load_result().
-    """
-    import glob
-    results_dir = "/app/data/results"
-    pattern = os.path.join(results_dir, f"{job_id}.*")
-    matches = glob.glob(pattern)
-    if not matches:
-        return None
-    result_path = matches[0]
-    ext = os.path.splitext(result_path)[1].lower()
-    mime_map = {
-        ".mp4":  ("video/mp4",   "output.mp4"),
-        ".mp3":  ("audio/mpeg",  "audio.mp3"),
-        ".wav":  ("audio/wav",   "audio.wav"),
-        ".opus": ("audio/opus",  "audio.opus"),
-        ".flac": ("audio/flac",  "audio.flac"),
-        ".png":  ("image/png",   "image.png"),
-        ".jpg":  ("image/jpeg",  "image.jpg"),
-        ".jpeg": ("image/jpeg",  "image.jpg"),
-    }
-    content_type, filename = mime_map.get(ext, ("application/octet-stream", f"result{ext}"))
-    with open(result_path, "rb") as f:
-        return f.read(), content_type, filename
 
 
 # -------------------------------------------------------
@@ -325,8 +307,11 @@ async def _guard_concurrency(raw_key: str, endpoint: str):
 
 @app.get("/health")
 async def health():
+    from jobs import check_redis_health
+    redis_ok = await check_redis_health()
     return {
-        "status":              "ok",
+        "status":              "ok" if redis_ok else "degraded",
+        "redis":               "connected" if redis_ok else "unreachable",
         "tts_backend":         KOKORO_BASE_URL,
         "flux_provider":       FLUX_PROVIDER,
         "fal_configured":      bool(FAL_API_KEY),
@@ -489,6 +474,8 @@ async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(
         raise HTTPException(status_code=400, detail="slides array is empty.")
     out_w = request.out_w or 720
     out_h = request.out_h or 1280
+    if out_w < 256 or out_w > 3840 or out_h < 256 or out_h > 3840:
+        raise HTTPException(status_code=400, detail="out_w and out_h must be between 256 and 3840.")
     if out_w % 2 != 0 or out_h % 2 != 0:
         raise HTTPException(status_code=400, detail="out_w and out_h must be divisible by 2.")
     cap_pos = None
