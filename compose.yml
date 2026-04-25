@@ -1,0 +1,71 @@
+services:
+
+  # ── Kokoro TTS (internal only) ────────────────────────────────────────────
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: tapi_kokoro
+    restart: unless-stopped
+    networks:
+      - tapinet
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # ── Redis — job state & concurrency counters ──────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: tapi_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - tapinet
+    volumes:
+      - redis_data:/data
+
+  # ── ConnectCircuits TTS/media API ─────────────────────────────────────────
+  tts-api:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: tapi-api
+    restart: unless-stopped
+    networks:
+      - tapinet
+    depends_on:
+      - kokoro
+      - redis
+    ports:
+      - "8800:8000"
+    volumes:
+      - api_data:/app/data
+    environment:
+      # --- Core ---
+      - KOKORO_BASE_URL=http://kokoro:8880
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
+      # --- Auth ---
+      - CONNECTCIRCUITS_API_KEY=${CONNECTCIRCUITS_API_KEY}
+      - ADMIN_SECRET=${ADMIN_SECRET}
+      # --- Redis ---
+      - REDIS_URL=redis://redis:6379/0
+      # --- Storage paths ---
+      - KEYS_DB_PATH=/app/data/api_keys.db
+      - RESULTS_DIR=/app/data/results
+      - RESULT_TTL_SEC=${RESULT_TTL_SEC:-21600}
+      - JOB_TTL_SEC=${JOB_TTL_SEC:-21600}
+      # --- Concurrency ---
+      - USER_CONCURRENCY_CAP=${USER_CONCURRENCY_CAP:-3}
+      - GLOBAL_WORKER_CONCURRENCY=${GLOBAL_WORKER_CONCURRENCY:-5}
+      # --- Webhook ---
+      - WEBHOOK_TIMEOUT_SEC=${WEBHOOK_TIMEOUT_SEC:-10}
+      - WEBHOOK_RETRIES=${WEBHOOK_RETRIES:-3}
+      # --- Image providers ---
+      - FLUX_PROVIDER=${FLUX_PROVIDER:-fal}
+      - FAL_API_KEY=${FAL_API_KEY:-}
+      - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
+
+networks:
+  tapinet:
+    driver: bridge
+
+volumes:
+  redis_data:
+  api_data:
