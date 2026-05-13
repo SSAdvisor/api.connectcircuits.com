@@ -685,3 +685,139 @@ async def build_slide_segment(
         raise RuntimeError(f"Slide {index} compose error: {stderr2.decode()[:400]}")
 
     return seg_path, tmp_files
+
+
+# -------------------------------------------------------
+# Text Thumbnail Generator
+# -------------------------------------------------------
+
+async def generate_text_thumbnail(
+    top_text: str,
+    bottom_text: str,
+    avatar_url: str,
+    width: int = 1280,
+    height: int = 720,
+    split_ratio: float = 0.555,
+    bar_ratio: float = 0.165,
+    bar_color: tuple = (255, 215, 0),
+    top_text_color: tuple = (255, 255, 255),
+    bottom_text_color: tuple = (0, 0, 0),
+    bg_color: tuple = (0, 0, 0),
+    font_path: str = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+) -> bytes:
+    """
+    Generate a YouTube-style text thumbnail (1280x720 JPEG).
+
+    Layout:
+      - Left column (split_ratio of width): black bg + top_text in white bold
+      - Right column: avatar image scaled/cropped to fill
+      - Bottom bar (bar_ratio of height, full width): colored bar + bottom_text in black bold
+      - Both texts are auto-sized to fill their area
+
+    Returns raw JPEG bytes.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import io as _io
+    import textwrap as _textwrap
+
+    W, H          = width, height
+    SPLIT_X       = int(W * split_ratio)
+    AVATAR_AREA_W = W - SPLIT_X
+    BOTTOM_BAR_H  = int(H * bar_ratio)
+    bar_y         = H - BOTTOM_BAR_H
+
+    # Font loader with Liberation Sans Bold fallback chain
+    _font_candidates = [
+        font_path,
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+
+    def _load_font(size: int) -> ImageFont.FreeTypeFont:
+        for fp in _font_candidates:
+            try:
+                return ImageFont.truetype(fp, size)
+            except (OSError, IOError):
+                continue
+        return ImageFont.load_default()
+
+    def _fit_text(draw, text: str, max_w: int, max_h: int,
+                  start: int = 90, stop: int = 22, lsr: float = 0.22):
+        """Return (font, wrapped_text, text_w, text_h, spacing) at largest fitting size."""
+        text_upper = text.upper()
+        for size in range(start, stop - 1, -2):
+            font    = _load_font(size)
+            spacing = int(size * lsr)
+            cw      = max(1, draw.textbbox((0, 0), "W", font=font)[2])
+            chars   = max(8, int(max_w / cw))
+            wrapped = _textwrap.fill(text_upper, width=chars)
+            bbox    = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
+            tw, th  = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if tw <= max_w and th <= max_h:
+                return font, wrapped, tw, th, spacing
+        # fallback: min size
+        font    = _load_font(stop)
+        spacing = int(stop * lsr)
+        wrapped = _textwrap.fill(text_upper, width=20)
+        bbox    = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
+        return font, wrapped, bbox[2]-bbox[0], bbox[3]-bbox[1], spacing
+
+    # ── Canvas ──────────────────────────────────────────────────────────────
+    img  = Image.new("RGB", (W, H), bg_color)
+    draw = ImageDraw.Draw(img)
+
+    # ── Avatar (right column) ────────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            resp = await client.get(avatar_url)
+            resp.raise_for_status()
+        av = Image.open(_io.BytesIO(resp.content)).convert("RGB")
+        aw, ah = av.size
+        scale  = max(AVATAR_AREA_W / aw, H / ah)
+        nw, nh = int(aw * scale), int(ah * scale)
+        av     = av.resize((nw, nh), Image.LANCZOS)
+        left   = (nw - AVATAR_AREA_W) // 2
+        top    = (nh - H) // 2
+        av     = av.crop((left, top, left + AVATAR_AREA_W, top + H))
+        img.paste(av, (SPLIT_X, 0))
+    except Exception:
+        # Gray placeholder if avatar fetch fails
+        draw.rectangle([SPLIT_X, 0, W, H], fill=(50, 50, 50))
+
+    # ── Yellow (or custom) bottom bar ────────────────────────────────────────
+    draw.rectangle([0, bar_y, W, H], fill=bar_color)
+
+    # ── Top text (left column, above bar) ────────────────────────────────────
+    pad    = 32
+    t_maxw = SPLIT_X - pad * 2
+    t_maxh = bar_y   - pad * 2
+    font_t, wrap_t, tw, th, sp_t = _fit_text(draw, top_text, t_maxw, t_maxh)
+    tx = pad + (t_maxw - tw) // 2
+    ty = pad + (t_maxh - th) // 2
+    # Drop shadow
+    draw.multiline_text((tx+3, ty+3), wrap_t, font=font_t,
+                        fill=(0, 0, 0), spacing=sp_t, align="center")
+    # Main text
+    draw.multiline_text((tx, ty), wrap_t, font=font_t,
+                        fill=top_text_color, spacing=sp_t, align="center")
+
+    # ── Bottom text (full-width bar) ─────────────────────────────────────────
+    bp     = 30
+    b_maxw = W - bp * 2
+    b_maxh = BOTTOM_BAR_H - 16
+    font_b, wrap_b, bw, bh, sp_b = _fit_text(
+        draw, bottom_text, b_maxw, b_maxh, start=52, stop=18
+    )
+    bx = bp + (b_maxw - bw) // 2
+    by = bar_y + (BOTTOM_BAR_H - bh) // 2
+    # Subtle shadow on the bar
+    draw.multiline_text((bx+2, by+2), wrap_b, font=font_b,
+                        fill=(80, 60, 0), spacing=sp_b, align="center")
+    draw.multiline_text((bx, by), wrap_b, font=font_b,
+                        fill=bottom_text_color, spacing=sp_b, align="center")
+
+    # ── Output ───────────────────────────────────────────────────────────────
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG", quality=92, optimize=True)
+    return buf.getvalue()
