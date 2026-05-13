@@ -1,13 +1,11 @@
-version: "3.8"
-
 services:
   # ── Kokoro TTS (internal only) ────────────────────────────────────────────
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: tapi_kokoro
+    container_name: api_kokoro
     restart: unless-stopped
     networks:
-      - tapinet
+      - apinet
     environment:
       - PYTHONUNBUFFERED=1
 
@@ -16,10 +14,10 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    container_name: tapi-api
+    container_name: api-api
     restart: unless-stopped
     networks:
-      - tapinet
+      - apinet
     depends_on:
       - kokoro
     ports:
@@ -50,7 +48,7 @@ services:
       - TOGETHER_API_KEY=${TOGETHER_API_KEY:-}
 
 networks:
-  tapinet:
+  apinet:
     driver: bridge
 
 volumes:
