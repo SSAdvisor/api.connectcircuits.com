@@ -710,20 +710,21 @@ async def generate_text_thumbnail(
       - Left panel (~60%): black bg, large bold white ALL-CAPS top_text
       - Right panel (~40%): avatar_url image, flush-fit, full height
       - Bottom banner: full-width yellow strip with bold black bottom_text
+    Auto-shrinks font until all text fits above the banner.
     Returns (bytes, "image/png").
     """
     from PIL import Image, ImageDraw, ImageFont
     import io
     import httpx as _httpx
 
-    AVATAR_RATIO  = 0.40          # right panel width fraction
-    BANNER_RATIO  = 0.155         # bottom banner height fraction
-    TEXT_PADDING  = 52            # left/right padding inside text panel
+    AVATAR_RATIO = 0.40
+    BANNER_RATIO = 0.155
+    TEXT_PADDING = 52
 
-    banner_h   = int(height * BANNER_RATIO)
-    text_h     = height - banner_h
-    avatar_w   = int(width * AVATAR_RATIO)
-    text_w     = width - avatar_w
+    banner_h = int(height * BANNER_RATIO)
+    text_h   = height - banner_h          # usable height above banner
+    avatar_w = int(width * AVATAR_RATIO)
+    text_w   = width - avatar_w
 
     def _parse_hex(h: str):
         h = h.lstrip("#")
@@ -749,7 +750,6 @@ async def generate_text_thumbnail(
                 pass
         return ImageFont.load_default()
 
-    # ── Base canvas ───────────────────────────────────────────────────────────
     img  = Image.new("RGB", (width, height), color=_parse_hex(bg_color))
     draw = ImageDraw.Draw(img)
 
@@ -760,24 +760,29 @@ async def generate_text_thumbnail(
                 resp = await client.get(avatar_url)
                 resp.raise_for_status()
             avatar_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-            # Scale to fill full height, crop width to avatar_w
             orig_w, orig_h = avatar_img.size
-            scale = height / orig_h
+
+            # Scale so the image FILLS both dimensions (cover, not contain)
+            scale_by_h = height / orig_h
+            scale_by_w = avatar_w / orig_w
+            scale = max(scale_by_h, scale_by_w)          # cover
             new_w = int(orig_w * scale)
-            avatar_img = avatar_img.resize((new_w, height), Image.LANCZOS)
-            # Centre-crop to avatar_w
-            left = max(0, (new_w - avatar_w) // 2)
-            avatar_img = avatar_img.crop((left, 0, left + avatar_w, height))
+            new_h = int(orig_h * scale)
+            avatar_img = avatar_img.resize((new_w, new_h), Image.LANCZOS)
+
+            # Centre-crop to exact (avatar_w x height)
+            left = (new_w - avatar_w) // 2
+            top  = (new_h - height)   // 2
+            avatar_img = avatar_img.crop((left, top, left + avatar_w, top + height))
             img.paste(avatar_img, (text_w, 0))
         except Exception:
-            # No avatar — extend bg to full width silently
-            pass
+            pass  # no avatar — full-width bg
 
     # ── Bottom banner ─────────────────────────────────────────────────────────
     banner_y = height - banner_h
     draw.rectangle([(0, banner_y), (width, height)], fill=_parse_hex(bottom_bg_color))
 
-    # ── Word-wrap helper ─────────────────────────────────────────────────────
+    # ── Word-wrap ────────────────────────────────────────────────────────────
     def _wrap(text: str, font, max_w: int) -> list:
         words, lines, current = text.split(), [], ""
         for word in words:
@@ -792,41 +797,53 @@ async def generate_text_thumbnail(
             lines.append(current)
         return lines
 
-    # ── Top text (left panel, vertically centred above banner) ───────────────
-    top_font   = _load_font(top_font_size)
-    usable_w   = text_w - TEXT_PADDING * 2
-    top_lines  = _wrap(top_text.upper(), top_font, usable_w)
-    line_gap   = 10
-
-    def _block_h(lines, font, gap=10):
+    def _block_height(lines, font, gap):
         total = 0
         for ln in lines:
             bb = draw.textbbox((0, 0), ln, font=font)
             total += (bb[3] - bb[1]) + gap
         return max(0, total - gap)
 
-    block_h = _block_h(top_lines, top_font, line_gap)
-    y = (text_h - block_h) // 2
+    # ── Auto-shrink top font until text fits in text_h with padding ──────────
+    LINE_GAP     = 12
+    usable_w     = text_w - TEXT_PADDING * 2
+    usable_h     = text_h - TEXT_PADDING * 2
+    font_size    = top_font_size
+    MIN_FONT     = 28
+
+    while font_size >= MIN_FONT:
+        top_font  = _load_font(font_size)
+        top_lines = _wrap(top_text.upper(), top_font, usable_w)
+        blk_h     = _block_height(top_lines, top_font, LINE_GAP)
+        if blk_h <= usable_h:
+            break
+        font_size -= 4
+
+    # ── Draw top text — vertically centred in text_h ─────────────────────────
+    blk_h = _block_height(top_lines, top_font, LINE_GAP)
+    y = (text_h - blk_h) // 2
 
     for ln in top_lines:
         bb = draw.textbbox((0, 0), ln, font=top_font)
         lw = bb[2] - bb[0]
+        lh = bb[3] - bb[1]
         x  = TEXT_PADDING + (usable_w - lw) // 2
         draw.text((x, y), ln, font=top_font, fill=_parse_hex(top_text_color))
-        y += (bb[3] - bb[1]) + line_gap
+        y += lh + LINE_GAP
 
     # ── Bottom banner text ────────────────────────────────────────────────────
     if bottom_text:
         bot_font  = _load_font(bottom_font_size)
         bot_lines = _wrap(bottom_text.upper(), bot_font, width - TEXT_PADDING * 2)
-        bot_block = _block_h(bot_lines, bot_font, 6)
-        by = banner_y + (banner_h - bot_block) // 2
+        bot_blk_h = _block_height(bot_lines, bot_font, 6)
+        by = banner_y + (banner_h - bot_blk_h) // 2
         for ln in bot_lines:
             bb  = draw.textbbox((0, 0), ln, font=bot_font)
             lw  = bb[2] - bb[0]
+            lh  = bb[3] - bb[1]
             bx  = (width - lw) // 2
             draw.text((bx, by), ln, font=bot_font, fill=_parse_hex(bottom_text_color))
-            by += (bb[3] - bb[1]) + 6
+            by += lh + 6
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
