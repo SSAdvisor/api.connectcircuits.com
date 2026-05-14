@@ -41,12 +41,12 @@ def _get_db() -> sqlite3.Connection:
     return conn
 
 
-
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
     """Idempotent ALTER TABLE — only adds the column if it doesn't already exist."""
     existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
@@ -93,7 +93,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_created_at  ON jobs(created_at);
     """)
-    # ── Safe migrations — idempotent, run on every startup ───────────────────
+    # ── Safe migrations ────────────────────────────────────────────────────────
     _add_column_if_missing(conn, "jobs", "queue_position", "INTEGER")
     _add_column_if_missing(conn, "jobs", "request_meta",   "TEXT NOT NULL DEFAULT '{}'")
     conn.commit()
@@ -343,12 +343,22 @@ def update_job(job_id: str, **fields) -> None:
     conn.close()
 
 
+def get_global_queue_length() -> int:
+    """Return total number of currently queued jobs across all users."""
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'queued'"
+    ).fetchone()
+    conn.close()
+    return row["cnt"] if row else 0
+
+
 def get_user_active_job_count(user_key_hash: str) -> int:
     """Count how many jobs a user has in pending or running state."""
     conn = _get_db()
     row = conn.execute(
         """SELECT COUNT(*) as cnt FROM jobs
-           WHERE user_key_hash = ? AND status IN ('pending', 'running')""",
+           WHERE user_key_hash = ? AND status IN ('queued', 'started')""",
         (user_key_hash,),
     ).fetchone()
     conn.close()
