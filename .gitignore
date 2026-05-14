@@ -1,4 +1,6 @@
 *.old
+*.bak
 __pycache__
 .env
 *.diff
+data

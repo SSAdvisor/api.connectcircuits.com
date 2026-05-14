@@ -2,7 +2,7 @@ services:
   # ── Kokoro TTS (internal only) ────────────────────────────────────────────
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
-    container_name: api_kokoro
+    container_name: kokoro
     restart: unless-stopped
     networks:
       - apinet
@@ -14,14 +14,14 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    container_name: api-api
+    container_name: api
     restart: unless-stopped
     networks:
       - apinet
     depends_on:
       - kokoro
     ports:
-      - "8800:8000"
+      - "8000:8000"
     volumes:
       - api_data:/app/data
     environment:
