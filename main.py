@@ -26,8 +26,11 @@ from store import (
     check_user_concurrency,
 )
 from jobs import (
-    run_job,
+    enqueue_job,
+    start_queue_workers,
+    get_queue_depth,
     periodic_cleanup,
+    GLOBAL_WORKER_CONCURRENCY,
 )
 from admin import router as admin_router
 from helpers import (
@@ -80,12 +83,11 @@ COLOR_MAP = {
 
 @app.on_event("startup")
 async def startup():
-    # Triggers _ensure_schema() which creates the jobs table
     conn = _get_db()
     conn.close()
-    logger.info("DB initialized. API ready.")
+    start_queue_workers()
     asyncio.create_task(periodic_cleanup(interval_sec=3600))
-    logger.info("Background cleanup task started.")
+    logger.info(f"API ready. {GLOBAL_WORKER_CONCURRENCY} queue workers started.")
 
 
 # -------------------------------------------------------
@@ -142,7 +144,7 @@ def _timing_method_label(chunk_paths, audio_path, do_captions, caption_text):
 def _job_response(job_id: str, webhook_url: Optional[str]) -> dict:
     return {
         "job_id":      job_id,
-        "status":      "pending",
+        "status":      "queued",
         "webhook_url": webhook_url or None,
         "status_url":  f"{PUBLIC_BASE_URL}/v1/jobs/{job_id}",
         "result_url":  f"{PUBLIC_BASE_URL}/v1/jobs/{job_id}/result",
@@ -182,7 +184,9 @@ async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
     return {
         "job_id":       job["job_id"],
         "endpoint":     job["endpoint"],
-        "status":       job["status"],
+        "status":         job["status"],
+        "queue_position": job.get("queue_position"),
+        "queue_depth":    get_queue_depth(),
         "created_at":   job.get("created_at"),
         "started_at":   job.get("started_at") or None,
         "completed_at": job.get("completed_at") or None,
@@ -280,11 +284,11 @@ class ImageGenerateRequest(AsyncBase):
 class TextThumbnailRequest(AsyncBase):
     title: str = Field(..., description="Main heading text rendered on the thumbnail.")
     subtitle: Optional[str] = Field(None, description="Secondary line below the title.")
-    width: int = Field(1280, ge=256, le=3840, description="Output image width in pixels.")
-    height: int = Field(720, ge=144, le=2160, description="Output image height in pixels.")
-    bg_color: Optional[str] = Field("#1a1a2e", description="Background color as hex (e.g. #1a1a2e).")
-    title_color: Optional[str] = Field("#ffffff", description="Title text color as hex.")
-    subtitle_color: Optional[str] = Field("#cccccc", description="Subtitle text color as hex.")
+    width: int = Field(1280, ge=256, le=3840)
+    height: int = Field(720, ge=144, le=2160)
+    bg_color: Optional[str] = Field("#1a1a2e", description="Background hex color.")
+    title_color: Optional[str] = Field("#ffffff")
+    subtitle_color: Optional[str] = Field("#cccccc")
     title_font_size: Optional[int] = Field(80, ge=12, le=300)
     subtitle_font_size: Optional[int] = Field(44, ge=12, le=200)
     font_path: Optional[str] = Field(None, description="Absolute path to a .ttf font inside the container.")
@@ -401,7 +405,7 @@ async def generate_audio(request: AudioGenerateRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/audio", key_hash, request.webhook_url, request.dict())
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/audio", task_fn=_task,
         result_filename=f"audio.{request.response_format or 'mp3'}",
@@ -468,13 +472,14 @@ async def generate_image(request: ImageGenerateRequest, raw_key: str = Security(
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 
     job_id = create_job("/v1/generate/image", key_hash, request.webhook_url, request.dict())
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/image", task_fn=_task,
         result_filename="image.png",
         public_base_url=PUBLIC_BASE_URL,
     ))
     return _job_response(job_id, request.webhook_url)
+
 
 
 # -------------------------------------------------------
@@ -494,9 +499,9 @@ async def generate_text_thumbnail_endpoint(
             subtitle           = request.subtitle,
             width              = request.width,
             height             = request.height,
-            bg_color           = request.bg_color   or "#1a1a2e",
-            title_color        = request.title_color    or "#ffffff",
-            subtitle_color     = request.subtitle_color or "#cccccc",
+            bg_color           = request.bg_color           or "#1a1a2e",
+            title_color        = request.title_color        or "#ffffff",
+            subtitle_color     = request.subtitle_color     or "#cccccc",
             title_font_size    = request.title_font_size    or 80,
             subtitle_font_size = request.subtitle_font_size or 44,
             font_path          = request.font_path,
@@ -608,7 +613,7 @@ async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/slideshow", key_hash, request.webhook_url, {"slide_count": len(request.slides)})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/slideshow", task_fn=_task,
         result_filename="slideshow.mp4",
@@ -734,7 +739,7 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/video", key_hash, request.webhook_url, {"video_url": request.video_url})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video", task_fn=_task,
         result_filename="output.mp4",
@@ -857,7 +862,7 @@ async def generate_video_captions(request: VideoCaptionRequest, raw_key: str = S
                 pass
 
     job_id = create_job("/v1/generate/video/captions", key_hash, request.webhook_url, {"video_url": request.video_url})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video/captions", task_fn=_task,
         result_filename="captioned.mp4",

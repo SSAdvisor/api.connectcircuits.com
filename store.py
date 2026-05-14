@@ -5,16 +5,7 @@ Schema
 ------
 api_keys   : hashed keys, user labels, tiers, status, timestamps
 usage_log  : per-request log (key_hash, endpoint, job_id, status, ts)
-jobs       : async job state
-
-Job lifecycle:
-  queued → started → complete
-                   → failed
-
-- "queued"   : job accepted, waiting in the global asyncio queue
-- "started"  : job dequeued and actively processing
-- "complete" : job finished successfully, result available
-- "failed"   : job encountered an error
+jobs       : async job state (lifecycle: pending → running → complete | failed)
 
 All raw keys are hashed with SHA-256 before storage.
 The raw key is returned ONCE at creation and never stored.
@@ -30,12 +21,12 @@ import json
 from pathlib import Path
 from typing import Optional
 
-DB_PATH        = Path(os.getenv("DB_PATH",        "/app/data/store.db"))
-RESULTS_DIR    = Path(os.getenv("RESULTS_DIR",    "/app/data/results"))
-RESULT_TTL_SEC = int(os.getenv("RESULT_TTL_SEC",  str(60 * 60 * 6)))
-JOB_TTL_SEC    = int(os.getenv("JOB_TTL_SEC",     str(60 * 60 * 6)))
+DB_PATH = Path(os.getenv("DB_PATH", "/app/data/store.db"))
+RESULTS_DIR = Path(os.getenv("RESULTS_DIR", "/app/data/results"))
+RESULT_TTL_SEC = int(os.getenv("RESULT_TTL_SEC", str(60 * 60 * 6)))
+JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", str(60 * 60 * 6)))
 
-# Per-user queue depth cap — how many queued+started jobs a single key may have at once
+# Per-user concurrency cap
 CONCURRENCY_CAP = int(os.getenv("USER_CONCURRENCY_CAP", "3"))
 
 
@@ -49,6 +40,13 @@ def _get_db() -> sqlite3.Connection:
     _ensure_schema(conn)
     return conn
 
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    """Idempotent ALTER TABLE — only adds the column if it doesn't already exist."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
@@ -77,8 +75,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             endpoint        TEXT    NOT NULL,
             user_key_hash   TEXT    NOT NULL,
             webhook_url     TEXT    NOT NULL DEFAULT '',
-            status          TEXT    NOT NULL DEFAULT 'queued',
-            queue_position  INTEGER,
+            status          TEXT    NOT NULL DEFAULT 'pending',
             created_at      INTEGER NOT NULL,
             started_at      INTEGER,
             completed_at    INTEGER,
@@ -96,6 +93,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_jobs_created_at  ON jobs(created_at);
     """)
+    # ── Safe migrations — idempotent, run on every startup ───────────────────
+    _add_column_if_missing(conn, "jobs", "queue_position", "INTEGER")
+    _add_column_if_missing(conn, "jobs", "request_meta",   "TEXT NOT NULL DEFAULT '{}'")
     conn.commit()
 
 
@@ -110,13 +110,13 @@ def save_result(job_id: str, data: bytes, content_type: str, filename: str) -> N
     """Save a job result to disk."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ext_map = {
-        "video/mp4":   ".mp4",
-        "audio/mpeg":  ".mp3",
-        "audio/wav":   ".wav",
-        "audio/opus":  ".opus",
-        "audio/flac":  ".flac",
-        "image/png":   ".png",
-        "image/jpeg":  ".jpg",
+        "video/mp4": ".mp4",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "audio/opus": ".opus",
+        "audio/flac": ".flac",
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
     }
     ext = ext_map.get(content_type, ".bin")
     result_path = RESULTS_DIR / f"{job_id}{ext}"
@@ -157,7 +157,8 @@ def cleanup_expired_results() -> int:
     removed = 0
     for f in RESULTS_DIR.iterdir():
         if f.is_file():
-            if now - f.stat().st_mtime > RESULT_TTL_SEC:
+            age = now - f.stat().st_mtime
+            if age > RESULT_TTL_SEC:
                 try:
                     f.unlink()
                     removed += 1
@@ -167,9 +168,11 @@ def cleanup_expired_results() -> int:
 
 
 def cleanup_old_usage_logs(days: int = 30) -> int:
+    """Delete usage_log entries older than N days. Returns count removed."""
     conn = _get_db()
     cursor = conn.execute(
-        "DELETE FROM usage_log WHERE ts < datetime('now', ?)", (f"-{days} days",)
+        "DELETE FROM usage_log WHERE ts < datetime('now', ?)",
+        (f"-{days} days",)
     )
     count = cursor.rowcount
     conn.commit()
@@ -178,11 +181,12 @@ def cleanup_old_usage_logs(days: int = 30) -> int:
 
 
 def cleanup_old_jobs(days: int = 7) -> int:
+    """Delete completed/failed jobs older than N days. Returns count removed."""
     conn = _get_db()
     cutoff = int(time.time()) - (days * 86400)
     cursor = conn.execute(
         "DELETE FROM jobs WHERE status IN ('complete', 'failed') AND completed_at < ?",
-        (cutoff,),
+        (cutoff,)
     )
     count = cursor.rowcount
     conn.commit()
@@ -211,19 +215,24 @@ def create_api_key(user_label: str, tier: str = "standard") -> str:
 
 
 def revoke_api_key(raw_key: str) -> None:
+    """Mark a key as revoked by its raw value."""
     key_hash = _hash_key(raw_key)
     conn = _get_db()
     conn.execute(
-        "UPDATE api_keys SET status = 'revoked' WHERE key_hash = ?", (key_hash,)
+        "UPDATE api_keys SET status = 'revoked' WHERE key_hash = ?",
+        (key_hash,),
     )
     conn.commit()
     conn.close()
 
 
 def list_api_keys() -> list:
+    """Return all keys as a list of dicts (no raw key — hashes only)."""
     conn = _get_db()
     rows = conn.execute(
-        "SELECT id, user_label, tier, status, created_at, last_seen FROM api_keys ORDER BY created_at DESC"
+        """SELECT id, user_label, tier, status, created_at, last_seen
+           FROM api_keys
+           ORDER BY created_at DESC"""
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -240,11 +249,13 @@ def verify_api_key(raw_key: str) -> Optional[dict]:
     key_hash = _hash_key(raw_key)
     conn = _get_db()
     row = conn.execute(
-        "SELECT * FROM api_keys WHERE key_hash = ? AND status = 'active'", (key_hash,)
+        "SELECT * FROM api_keys WHERE key_hash = ? AND status = 'active'",
+        (key_hash,),
     ).fetchone()
     if row:
         conn.execute(
-            "UPDATE api_keys SET last_seen = datetime('now') WHERE key_hash = ?", (key_hash,)
+            "UPDATE api_keys SET last_seen = datetime('now') WHERE key_hash = ?",
+            (key_hash,),
         )
         conn.commit()
     conn.close()
@@ -259,15 +270,13 @@ def create_job(
     webhook_url: Optional[str],
     request_payload: dict,
 ) -> str:
-    """
-    Create a QUEUED job in SQLite. Returns job_id.
-    queue_position is set to the next available slot (1-based).
-    """
+    """Create a PENDING job in SQLite. Returns job_id."""
+    # Validate webhook URL if provided
     if webhook_url and not is_safe_webhook_url(webhook_url):
         raise ValueError(f"Invalid webhook URL: {webhook_url}")
 
     job_id = str(uuid.uuid4())
-    now    = int(time.time())
+    now = int(time.time())
 
     request_meta = json.dumps({
         k: v for k, v in request_payload.items()
@@ -275,18 +284,12 @@ def create_job(
     })
 
     conn = _get_db()
-    # queue_position = number of currently queued jobs + 1
-    row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'queued'"
-    ).fetchone()
-    queue_pos = (row["cnt"] if row else 0) + 1
-
     conn.execute(
         """INSERT INTO jobs
            (job_id, endpoint, user_key_hash, webhook_url, status,
-            queue_position, created_at, result_headers, request_meta)
-           VALUES (?, ?, ?, ?, 'queued', ?, ?, '{}', ?)""",
-        (job_id, endpoint, user_key_hash, webhook_url or "", queue_pos, now, request_meta),
+            created_at, result_headers, request_meta)
+           VALUES (?, ?, ?, ?, 'pending', ?, '{}', ?)""",
+        (job_id, endpoint, user_key_hash, webhook_url or "", now, request_meta),
     )
     conn.commit()
     conn.close()
@@ -296,7 +299,9 @@ def create_job(
 def get_job(job_id: str) -> Optional[dict]:
     """Retrieve a job by its ID."""
     conn = _get_db()
-    row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
     conn.close()
     if not row:
         return None
@@ -327,32 +332,23 @@ def get_job_by_user(job_id: str, user_key_hash: str) -> Optional[dict]:
 
 
 def update_job(job_id: str, **fields) -> None:
-    """Update arbitrary fields on a job row."""
+    """Update arbitrary fields on a job."""
     if not fields:
         return
     set_clause = ", ".join(f"{k} = ?" for k in fields)
-    values     = list(fields.values()) + [job_id]
+    values = list(fields.values()) + [job_id]
     conn = _get_db()
     conn.execute(f"UPDATE jobs SET {set_clause} WHERE job_id = ?", values)
     conn.commit()
     conn.close()
 
 
-def get_global_queue_length() -> int:
-    """Return total number of currently queued jobs across all users."""
-    conn = _get_db()
-    row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'queued'"
-    ).fetchone()
-    conn.close()
-    return row["cnt"] if row else 0
-
-
 def get_user_active_job_count(user_key_hash: str) -> int:
-    """Count queued+started jobs for a single user."""
+    """Count how many jobs a user has in pending or running state."""
     conn = _get_db()
     row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM jobs WHERE user_key_hash = ? AND status IN ('queued', 'started')",
+        """SELECT COUNT(*) as cnt FROM jobs
+           WHERE user_key_hash = ? AND status IN ('pending', 'running')""",
         (user_key_hash,),
     ).fetchone()
     conn.close()
@@ -360,8 +356,9 @@ def get_user_active_job_count(user_key_hash: str) -> int:
 
 
 def check_user_concurrency(user_key_hash: str) -> bool:
-    """Returns True if user is under the per-user queue cap."""
-    return get_user_active_job_count(user_key_hash) < CONCURRENCY_CAP
+    """Returns True if user is under the concurrency cap."""
+    count = get_user_active_job_count(user_key_hash)
+    return count < CONCURRENCY_CAP
 
 
 # ── Webhook URL Validation ─────────────────────────────────────────────────────
@@ -393,15 +390,22 @@ def is_safe_webhook_url(url: str) -> bool:
 # ── Usage Logging ──────────────────────────────────────────────────────────────
 
 def log_usage(
-    raw_key:  Optional[str],
+    raw_key: Optional[str],
     endpoint: str,
     job_id:   Optional[str] = None,
     status:   str = "queued",
 ) -> None:
+    """
+    Record a single API request.  key_hash may be None for unauthenticated
+    requests that were rejected (so we still count 401s).
+    """
+    if raw_key and not isinstance(raw_key, str):
+        return
     key_hash = _hash_key(raw_key) if raw_key else None
     conn = _get_db()
     conn.execute(
-        "INSERT INTO usage_log (key_hash, endpoint, job_id, status, ts) VALUES (?, ?, ?, ?, datetime('now'))",
+        """INSERT INTO usage_log (key_hash, endpoint, job_id, status, ts)
+           VALUES (?, ?, ?, ?, datetime('now'))""",
         (key_hash, endpoint, job_id, status),
     )
     conn.commit()
@@ -409,8 +413,12 @@ def log_usage(
 
 
 def update_usage_status(job_id: str, status: str) -> None:
+    """Update the status of a usage_log entry when a job completes or fails."""
     conn = _get_db()
-    conn.execute("UPDATE usage_log SET status = ? WHERE job_id = ?", (status, job_id))
+    conn.execute(
+        "UPDATE usage_log SET status = ? WHERE job_id = ?",
+        (status, job_id),
+    )
     conn.commit()
     conn.close()
 
@@ -418,8 +426,9 @@ def update_usage_status(job_id: str, status: str) -> None:
 # ── Periodic Cleanup ───────────────────────────────────────────────────────────
 
 def run_cleanup() -> dict:
-    return {
-        "expired_results": cleanup_expired_results(),
-        "old_usage_logs":  cleanup_old_usage_logs(days=30),
-        "old_jobs":        cleanup_old_jobs(days=7),
-    }
+    """Run all cleanup tasks. Returns a summary dict."""
+    results = {}
+    results["expired_results"] = cleanup_expired_results()
+    results["old_usage_logs"] = cleanup_old_usage_logs(days=30)
+    results["old_jobs"] = cleanup_old_jobs(days=7)
+    return results
