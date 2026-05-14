@@ -716,15 +716,15 @@ async def generate_text_thumbnail(
     import io
     import httpx as _httpx
 
-    AVATAR_RATIO = 0.40
+    AVATAR_W     = 380                    # fixed avatar column width (px)
     BANNER_RATIO = 0.155
     TEXT_PADDING = 52
     LINE_GAP     = 12
 
     banner_h = int(height * BANNER_RATIO)
-    text_h   = height - banner_h          # usable text area height above banner
-    avatar_w = int(width * AVATAR_RATIO)
-    text_w   = width - avatar_w           # left panel width
+    text_h   = height - banner_h          # usable height above banner
+    avatar_w = AVATAR_W                   # fixed 380px regardless of canvas width
+    text_w   = width - avatar_w           # left panel = 900px at 1280 wide
 
     def _parse_hex(h: str):
         h = h.lstrip("#")
