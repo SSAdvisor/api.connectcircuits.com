@@ -30,6 +30,7 @@ from jobs import (
     start_queue_workers,
     get_queue_depth,
     periodic_cleanup,
+    GLOBAL_WORKER_CONCURRENCY,
 )
 from admin import router as admin_router
 from helpers import (
