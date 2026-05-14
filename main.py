@@ -282,17 +282,19 @@ class ImageGenerateRequest(AsyncBase):
 
 
 class TextThumbnailRequest(AsyncBase):
-    title: str = Field(..., description="Main heading text rendered on the thumbnail.")
-    subtitle: Optional[str] = Field(None, description="Secondary line below the title.")
+    top_text: str = Field(..., description="Main heading — large bold text on the left panel.")
+    bottom_text: Optional[str] = Field(None, description="Bottom banner text. Omit for no banner text.")
+    avatar_url: Optional[str] = Field(None, description="URL of avatar/character image for the right panel.")
     width: int = Field(1280, ge=256, le=3840)
     height: int = Field(720, ge=144, le=2160)
-    bg_color: Optional[str] = Field("#1a1a2e", description="Background hex color.")
-    title_color: Optional[str] = Field("#ffffff")
-    subtitle_color: Optional[str] = Field("#cccccc")
-    title_font_size: Optional[int] = Field(80, ge=12, le=300)
-    subtitle_font_size: Optional[int] = Field(44, ge=12, le=200)
+    bg_color: Optional[str] = Field("#000000", description="Left panel background hex color.")
+    top_text_color: Optional[str] = Field("#ffffff", description="Top text hex color.")
+    bottom_bg_color: Optional[str] = Field("#FFD700", description="Bottom banner background hex color.")
+    bottom_text_color: Optional[str] = Field("#000000", description="Bottom banner text hex color.")
+    top_font_size: Optional[int] = Field(95, ge=12, le=300)
+    bottom_font_size: Optional[int] = Field(44, ge=12, le=200)
     font_path: Optional[str] = Field(None, description="Absolute path to a .ttf font inside the container.")
-    padding: Optional[int] = Field(80, ge=0, le=400)
+
 
 class SlideItem(BaseModel):
     image_url: str
@@ -495,22 +497,24 @@ async def generate_text_thumbnail_endpoint(
 
     async def _task():
         img_bytes, ctype = await generate_text_thumbnail(
-            title              = request.title,
-            subtitle           = request.subtitle,
-            width              = request.width,
-            height             = request.height,
-            bg_color           = request.bg_color           or "#1a1a2e",
-            title_color        = request.title_color        or "#ffffff",
-            subtitle_color     = request.subtitle_color     or "#cccccc",
-            title_font_size    = request.title_font_size    or 80,
-            subtitle_font_size = request.subtitle_font_size or 44,
-            font_path          = request.font_path,
-            padding            = request.padding if request.padding is not None else 80,
+            top_text          = request.top_text,
+            bottom_text       = request.bottom_text,
+            avatar_url        = request.avatar_url,
+            width             = request.width,
+            height            = request.height,
+            bg_color          = request.bg_color          or "#000000",
+            top_text_color    = request.top_text_color    or "#ffffff",
+            bottom_bg_color   = request.bottom_bg_color   or "#FFD700",
+            bottom_text_color = request.bottom_text_color or "#000000",
+            top_font_size     = request.top_font_size     or 95,
+            bottom_font_size  = request.bottom_font_size  or 44,
+            font_path         = request.font_path,
         )
         return img_bytes, ctype, {
             "X-Width":  str(request.width),
             "X-Height": str(request.height),
         }
+
 
     job_id = create_job("/v1/generate/text-thumbnail", key_hash, request.webhook_url, request.dict())
     asyncio.create_task(enqueue_job(

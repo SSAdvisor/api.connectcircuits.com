@@ -687,69 +687,61 @@ async def build_slide_segment(
 
     return seg_path, tmp_files
 
-
 # -------------------------------------------------------
-# Text Thumbnail Generator
+# Text Thumbnail Generator  (YouTube-style layout)
 # -------------------------------------------------------
 
 async def generate_text_thumbnail(
-    title: str,
-    subtitle: Optional[str] = None,
+    top_text: str,
+    bottom_text: Optional[str] = None,
+    avatar_url: Optional[str] = None,
     width: int = 1280,
     height: int = 720,
-    bg_color: str = "#1a1a2e",
-    title_color: str = "#ffffff",
-    subtitle_color: str = "#cccccc",
-    title_font_size: int = 80,
-    subtitle_font_size: int = 44,
+    bg_color: str = "#000000",
+    top_text_color: str = "#ffffff",
+    bottom_bg_color: str = "#FFD700",
+    bottom_text_color: str = "#000000",
+    top_font_size: int = 95,
+    bottom_font_size: int = 44,
     font_path: Optional[str] = None,
-    padding: int = 80,
 ) -> tuple:
     """
-    Render a text-based thumbnail image using Pillow.
-    Returns (bytes, content_type).
-
-    Args:
-        title:             Main heading text (required)
-        subtitle:          Secondary line below title (optional)
-        width/height:      Output image dimensions in pixels
-        bg_color:          Background hex color  (e.g. "#1a1a2e")
-        title_color:       Title text hex color
-        subtitle_color:    Subtitle text hex color
-        title_font_size:   Title font size in pt
-        subtitle_font_size: Subtitle font size in pt
-        font_path:         Absolute path to a .ttf font; falls back to Pillow default
-        padding:           Horizontal/vertical margin in pixels
+    Render a YouTube-style thumbnail:
+      - Left panel (~60%): black bg, large bold white ALL-CAPS top_text
+      - Right panel (~40%): avatar_url image, flush-fit, full height
+      - Bottom banner: full-width yellow strip with bold black bottom_text
+    Returns (bytes, "image/png").
     """
     from PIL import Image, ImageDraw, ImageFont
     import io
-    import textwrap
+    import httpx as _httpx
 
-    def _parse_color(hex_str: str) -> tuple:
-        """Convert '#rrggbb' or '#rgb' to (R, G, B)."""
-        h = hex_str.lstrip("#")
+    AVATAR_RATIO  = 0.40          # right panel width fraction
+    BANNER_RATIO  = 0.155         # bottom banner height fraction
+    TEXT_PADDING  = 52            # left/right padding inside text panel
+
+    banner_h   = int(height * BANNER_RATIO)
+    text_h     = height - banner_h
+    avatar_w   = int(width * AVATAR_RATIO)
+    text_w     = width - avatar_w
+
+    def _parse_hex(h: str):
+        h = h.lstrip("#")
         if len(h) == 3:
             h = "".join(c * 2 for c in h)
         return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-    bg_rgb       = _parse_color(bg_color)
-    title_rgb    = _parse_color(title_color)
-    subtitle_rgb = _parse_color(subtitle_color)
-
-    img  = Image.new("RGB", (width, height), color=bg_rgb)
-    draw = ImageDraw.Draw(img)
-
-    def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    def _load_font(size: int):
         if font_path:
             try:
                 return ImageFont.truetype(font_path, size)
             except (IOError, OSError):
                 pass
-        # Try common system fonts before falling back to Pillow default
         for candidate in (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
         ):
             try:
                 return ImageFont.truetype(candidate, size)
@@ -757,20 +749,41 @@ async def generate_text_thumbnail(
                 pass
         return ImageFont.load_default()
 
-    title_font    = _load_font(title_font_size)
-    subtitle_font = _load_font(subtitle_font_size)
+    # ── Base canvas ───────────────────────────────────────────────────────────
+    img  = Image.new("RGB", (width, height), color=_parse_hex(bg_color))
+    draw = ImageDraw.Draw(img)
 
-    usable_w = width - (padding * 2)
+    # ── Avatar panel (right) ─────────────────────────────────────────────────
+    if avatar_url:
+        try:
+            async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(avatar_url)
+                resp.raise_for_status()
+            avatar_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            # Scale to fill full height, crop width to avatar_w
+            orig_w, orig_h = avatar_img.size
+            scale = height / orig_h
+            new_w = int(orig_w * scale)
+            avatar_img = avatar_img.resize((new_w, height), Image.LANCZOS)
+            # Centre-crop to avatar_w
+            left = max(0, (new_w - avatar_w) // 2)
+            avatar_img = avatar_img.crop((left, 0, left + avatar_w, height))
+            img.paste(avatar_img, (text_w, 0))
+        except Exception:
+            # No avatar — extend bg to full width silently
+            pass
 
-    def _wrap(text: str, font: ImageFont.FreeTypeFont, max_w: int) -> list:
-        """Word-wrap text to fit within max_w pixels."""
-        words  = text.split()
-        lines  = []
-        current = ""
+    # ── Bottom banner ─────────────────────────────────────────────────────────
+    banner_y = height - banner_h
+    draw.rectangle([(0, banner_y), (width, height)], fill=_parse_hex(bottom_bg_color))
+
+    # ── Word-wrap helper ─────────────────────────────────────────────────────
+    def _wrap(text: str, font, max_w: int) -> list:
+        words, lines, current = text.split(), [], ""
         for word in words:
             test = (current + " " + word).strip()
-            bbox = draw.textbbox((0, 0), test, font=font)
-            if bbox[2] > max_w and current:
+            bb = draw.textbbox((0, 0), test, font=font)
+            if bb[2] > max_w and current:
                 lines.append(current)
                 current = word
             else:
@@ -779,40 +792,41 @@ async def generate_text_thumbnail(
             lines.append(current)
         return lines
 
-    title_lines    = _wrap(title, title_font, usable_w)
-    subtitle_lines = _wrap(subtitle, subtitle_font, usable_w) if subtitle else []
+    # ── Top text (left panel, vertically centred above banner) ───────────────
+    top_font   = _load_font(top_font_size)
+    usable_w   = text_w - TEXT_PADDING * 2
+    top_lines  = _wrap(top_text.upper(), top_font, usable_w)
+    line_gap   = 10
 
-    def _block_height(lines: list, font: ImageFont.FreeTypeFont, line_gap: int = 12) -> int:
-        if not lines:
-            return 0
-        h = 0
-        for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font)
-            h += (bbox[3] - bbox[1]) + line_gap
-        return h - line_gap
+    def _block_h(lines, font, gap=10):
+        total = 0
+        for ln in lines:
+            bb = draw.textbbox((0, 0), ln, font=font)
+            total += (bb[3] - bb[1]) + gap
+        return max(0, total - gap)
 
-    title_h    = _block_height(title_lines, title_font,    line_gap=16)
-    subtitle_h = _block_height(subtitle_lines, subtitle_font, line_gap=12)
-    gap        = 36 if subtitle_lines else 0
-    total_h    = title_h + gap + subtitle_h
+    block_h = _block_h(top_lines, top_font, line_gap)
+    y = (text_h - block_h) // 2
 
-    y = (height - total_h) // 2
+    for ln in top_lines:
+        bb = draw.textbbox((0, 0), ln, font=top_font)
+        lw = bb[2] - bb[0]
+        x  = TEXT_PADDING + (usable_w - lw) // 2
+        draw.text((x, y), ln, font=top_font, fill=_parse_hex(top_text_color))
+        y += (bb[3] - bb[1]) + line_gap
 
-    for line in title_lines:
-        bbox = draw.textbbox((0, 0), line, font=title_font)
-        lw   = bbox[2] - bbox[0]
-        x    = (width - lw) // 2
-        draw.text((x, y), line, font=title_font, fill=title_rgb)
-        y   += (bbox[3] - bbox[1]) + 16
-
-    y += gap - 16  # offset already added by last title line loop
-
-    for line in subtitle_lines:
-        bbox = draw.textbbox((0, 0), line, font=subtitle_font)
-        lw   = bbox[2] - bbox[0]
-        x    = (width - lw) // 2
-        draw.text((x, y), line, font=subtitle_font, fill=subtitle_rgb)
-        y   += (bbox[3] - bbox[1]) + 12
+    # ── Bottom banner text ────────────────────────────────────────────────────
+    if bottom_text:
+        bot_font  = _load_font(bottom_font_size)
+        bot_lines = _wrap(bottom_text.upper(), bot_font, width - TEXT_PADDING * 2)
+        bot_block = _block_h(bot_lines, bot_font, 6)
+        by = banner_y + (banner_h - bot_block) // 2
+        for ln in bot_lines:
+            bb  = draw.textbbox((0, 0), ln, font=bot_font)
+            lw  = bb[2] - bb[0]
+            bx  = (width - lw) // 2
+            draw.text((bx, by), ln, font=bot_font, fill=_parse_hex(bottom_text_color))
+            by += (bb[3] - bb[1]) + 6
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
