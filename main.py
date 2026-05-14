@@ -26,7 +26,9 @@ from store import (
     check_user_concurrency,
 )
 from jobs import (
-    run_job,
+    enqueue_job,
+    start_queue_workers,
+    get_queue_depth,
     periodic_cleanup,
 )
 from admin import router as admin_router
@@ -80,12 +82,11 @@ COLOR_MAP = {
 
 @app.on_event("startup")
 async def startup():
-    # Triggers _ensure_schema() which creates the jobs table
     conn = _get_db()
     conn.close()
-    logger.info("DB initialized. API ready.")
+    start_queue_workers()
     asyncio.create_task(periodic_cleanup(interval_sec=3600))
-    logger.info("Background cleanup task started.")
+    logger.info(f"API ready. {GLOBAL_WORKER_CONCURRENCY} queue workers started.")
 
 
 # -------------------------------------------------------
@@ -142,7 +143,7 @@ def _timing_method_label(chunk_paths, audio_path, do_captions, caption_text):
 def _job_response(job_id: str, webhook_url: Optional[str]) -> dict:
     return {
         "job_id":      job_id,
-        "status":      "pending",
+        "status":      "queued",
         "webhook_url": webhook_url or None,
         "status_url":  f"{PUBLIC_BASE_URL}/v1/jobs/{job_id}",
         "result_url":  f"{PUBLIC_BASE_URL}/v1/jobs/{job_id}/result",
@@ -180,14 +181,16 @@ async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
             raise HTTPException(status_code=403, detail="Access denied.")
         raise HTTPException(status_code=404, detail="Job not found or expired.")
     return {
-        "job_id":       job["job_id"],
-        "endpoint":     job["endpoint"],
-        "status":       job["status"],
-        "created_at":   job.get("created_at"),
-        "started_at":   job.get("started_at") or None,
-        "completed_at": job.get("completed_at") or None,
-        "result_url":   job.get("result_url") or None,
-        "error":        job.get("error") or None,
+        "job_id":         job["job_id"],
+        "endpoint":       job["endpoint"],
+        "status":         job["status"],
+        "queue_position": job.get("queue_position"),
+        "queue_depth":    get_queue_depth(),
+        "created_at":     job.get("created_at"),
+        "started_at":     job.get("started_at") or None,
+        "completed_at":   job.get("completed_at") or None,
+        "result_url":     job.get("result_url") or None,
+        "error":          job.get("error") or None,
     }
 
 
@@ -387,7 +390,7 @@ async def generate_audio(request: AudioGenerateRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/audio", key_hash, request.webhook_url, request.dict())
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/audio", task_fn=_task,
         result_filename=f"audio.{request.response_format or 'mp3'}",
@@ -454,7 +457,7 @@ async def generate_image(request: ImageGenerateRequest, raw_key: str = Security(
         raise RuntimeError(f"All providers failed. Last error: {last_error}")
 
     job_id = create_job("/v1/generate/image", key_hash, request.webhook_url, request.dict())
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/image", task_fn=_task,
         result_filename="image.png",
@@ -554,7 +557,7 @@ async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/slideshow", key_hash, request.webhook_url, {"slide_count": len(request.slides)})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/slideshow", task_fn=_task,
         result_filename="slideshow.mp4",
@@ -680,7 +683,7 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
                 pass
 
     job_id = create_job("/v1/generate/video", key_hash, request.webhook_url, {"video_url": request.video_url})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video", task_fn=_task,
         result_filename="output.mp4",
@@ -803,106 +806,10 @@ async def generate_video_captions(request: VideoCaptionRequest, raw_key: str = S
                 pass
 
     job_id = create_job("/v1/generate/video/captions", key_hash, request.webhook_url, {"video_url": request.video_url})
-    asyncio.create_task(run_job(
+    asyncio.create_task(enqueue_job(
         job_id=job_id, user_key_hash=key_hash, raw_key=raw_key,
         endpoint="/v1/generate/video/captions", task_fn=_task,
         result_filename="captioned.mp4",
         public_base_url=PUBLIC_BASE_URL,
-    ))
-    return _job_response(job_id, request.webhook_url)
-
-
-# -------------------------------------------------------
-# POST /v1/generate/text-thumbnail
-# -------------------------------------------------------
-
-class TextThumbnailRequest(AsyncBase):
-    top_text:    str   = Field(..., description="Large headline text displayed on the left column.")
-    bottom_text: str   = Field(..., description="Smaller text displayed on the yellow bottom bar.")
-    avatar_url:  str   = Field(..., description="URL of the avatar/character image placed on the right.")
-    width:       int   = Field(1280, ge=320,  le=3840, description="Output width in pixels.")
-    height:      int   = Field(720,  ge=180,  le=2160, description="Output height in pixels.")
-    split_ratio: float = Field(0.555, ge=0.3, le=0.75, description="Fraction of width used for the text column (0.0–1.0).")
-    bar_ratio:   float = Field(0.165, ge=0.05, le=0.35, description="Fraction of height used for the bottom bar (0.0–1.0).")
-    bar_color:   Optional[str] = Field("yellow", description="Bottom bar color: 'yellow', 'white', 'red', 'blue', or hex '#RRGGBB'.")
-    top_text_color:    Optional[str] = Field("white",  description="Top headline text color.")
-    bottom_text_color: Optional[str] = Field("black",  description="Bottom bar text color.")
-    bg_color:    Optional[str] = Field("black",  description="Left-column background color.")
-
-
-def _parse_color(value: Optional[str], default: tuple) -> tuple:
-    """Parse a named color or '#RRGGBB' hex string into an RGB tuple."""
-    _named = {
-        "black":  (0, 0, 0),
-        "white":  (255, 255, 255),
-        "yellow": (255, 215, 0),
-        "red":    (220, 30, 30),
-        "blue":   (30, 80, 200),
-        "green":  (30, 160, 60),
-        "orange": (230, 110, 0),
-    }
-    if not value:
-        return default
-    v = value.strip().lower()
-    if v in _named:
-        return _named[v]
-    if v.startswith("#") and len(v) == 7:
-        try:
-            return (int(v[1:3], 16), int(v[3:5], 16), int(v[5:7], 16))
-        except ValueError:
-            pass
-    return default
-
-
-@app.post("/v1/generate/text-thumbnail", status_code=202)
-async def generate_text_thumbnail_endpoint(
-    request: TextThumbnailRequest,
-    raw_key: str = Security(verify_api_key),
-):
-    """
-    Generate a YouTube-style thumbnail with:
-      - Bold headline text on a dark left column
-      - Avatar/character image on the right
-      - Short callout text on a colored bottom bar
-    """
-    key_hash = await _guard_concurrency(raw_key, "/v1/generate/text-thumbnail")
-
-    bar_clr     = _parse_color(request.bar_color,         (255, 215, 0))
-    top_clr     = _parse_color(request.top_text_color,    (255, 255, 255))
-    bottom_clr  = _parse_color(request.bottom_text_color, (0, 0, 0))
-    bg_clr      = _parse_color(request.bg_color,          (0, 0, 0))
-
-    async def _task():
-        img_bytes = await generate_text_thumbnail(
-            top_text          = request.top_text,
-            bottom_text       = request.bottom_text,
-            avatar_url        = request.avatar_url,
-            width             = request.width,
-            height            = request.height,
-            split_ratio       = request.split_ratio,
-            bar_ratio         = request.bar_ratio,
-            bar_color         = bar_clr,
-            top_text_color    = top_clr,
-            bottom_text_color = bottom_clr,
-            bg_color          = bg_clr,
-        )
-        return img_bytes, "image/jpeg", {
-            "X-Width":  str(request.width),
-            "X-Height": str(request.height),
-        }
-
-    job_id = create_job(
-        "/v1/generate/text-thumbnail", key_hash,
-        request.webhook_url,
-        {"top_text": request.top_text[:80], "bottom_text": request.bottom_text[:80]},
-    )
-    asyncio.create_task(run_job(
-        job_id          = job_id,
-        user_key_hash   = key_hash,
-        raw_key         = raw_key,
-        endpoint        = "/v1/generate/text-thumbnail",
-        task_fn         = _task,
-        result_filename = "thumbnail.jpg",
-        public_base_url = PUBLIC_BASE_URL,
     ))
     return _job_response(job_id, request.webhook_url)
