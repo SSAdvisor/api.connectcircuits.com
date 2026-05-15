@@ -809,7 +809,7 @@ async def generate_text_thumbnail(
 
     # ── Auto-shrink top font until text fits above banner ────────────────────
     usable_w = text_w - TEXT_PADDING * 2
-    usable_h = text_h - TEXT_PADDING * 2
+    usable_h = text_h - (TEXT_PADDING // 2) - TEXT_PADDING  # top margin halved
     font_size = top_font_size
     MIN_FONT  = 28
 
@@ -822,7 +822,7 @@ async def generate_text_thumbnail(
 
     # ── Draw top text — vertically centred in text_h ─────────────────────────
     blk_h = _block_height(top_lines, top_font, LINE_GAP)
-    y = (text_h - blk_h) // 2
+    y = (TEXT_PADDING // 2) + ((text_h - (TEXT_PADDING // 2) - TEXT_PADDING - blk_h) // 2)
 
     for ln in top_lines:
         bb = draw.textbbox((0, 0), ln, font=top_font)
@@ -845,7 +845,9 @@ async def generate_text_thumbnail(
                 break
             bfs -= 2
         bot_blk_h = _block_height(bot_lines, bot_font, BOT_LINE_GAP)
-        by = banner_y + (banner_h - bot_blk_h) // 2
+        BOT_PAD_TOP = 8
+        BOT_PAD_BOT = 14
+        by = banner_y + BOT_PAD_TOP + ((banner_h - BOT_PAD_TOP - BOT_PAD_BOT - bot_blk_h) // 2)
         for ln in bot_lines:
             bb  = draw.textbbox((0, 0), ln, font=bot_font)
             lw, lh = bb[2] - bb[0], bb[3] - bb[1]
