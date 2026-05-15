@@ -1,3 +1,4 @@
+from typing import Optional, List
 import re
 import asyncio
 import subprocess
@@ -685,3 +686,176 @@ async def build_slide_segment(
         raise RuntimeError(f"Slide {index} compose error: {stderr2.decode()[:400]}")
 
     return seg_path, tmp_files
+
+# -------------------------------------------------------
+# Text Thumbnail Generator  (YouTube-style layout)
+# -------------------------------------------------------
+
+async def generate_text_thumbnail(
+    top_text: str,
+    bottom_text: Optional[str] = None,
+    avatar_url: Optional[str] = None,
+    width: int = 1280,
+    height: int = 720,
+    bg_color: str = "#000000",
+    top_text_color: str = "#ffffff",
+    bottom_bg_color: str = "#FFD700",
+    bottom_text_color: str = "#000000",
+    top_font_size: int = 89,
+    bottom_font_size: int = 44,
+    font_path: Optional[str] = None,
+) -> tuple:
+    """
+    Layout:
+      - Right panel (~40%): avatar image, full 720px height, cover-cropped, no truncation
+      - Left panel (~60%): black bg
+          - top section: large bold white ALL-CAPS top_text, vertically centred above banner
+          - bottom banner: yellow strip spanning left panel only, bold black bottom_text
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    import io
+    import httpx as _httpx
+
+    AVATAR_W     = 380                    # fixed avatar column width (px)
+    BANNER_RATIO = 0.155
+    TEXT_PADDING = 52
+    LINE_GAP     = 12
+
+    banner_h = int(height * BANNER_RATIO)
+    text_h   = height - banner_h          # usable height above banner
+    avatar_w = AVATAR_W                   # fixed 380px regardless of canvas width
+    text_w   = width - avatar_w           # left panel = 900px at 1280 wide
+
+    def _parse_hex(h: str):
+        h = h.lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+    def _load_font(size: int):
+        if font_path:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except (IOError, OSError):
+                pass
+        for candidate in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+            "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+        ):
+            try:
+                return ImageFont.truetype(candidate, size)
+            except (IOError, OSError):
+                pass
+        return ImageFont.load_default()
+
+    # ── Base canvas ───────────────────────────────────────────────────────────
+    img  = Image.new("RGB", (width, height), color=_parse_hex(bg_color))
+    draw = ImageDraw.Draw(img)
+
+    # ── Avatar panel (right) — full height, cover crop ───────────────────────
+    if avatar_url:
+        try:
+            async with _httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(avatar_url)
+                resp.raise_for_status()
+            avatar_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            orig_w, orig_h = avatar_img.size
+
+            # Cover scale: fill full height AND avatar_w, no black bars
+            scale = max(height / orig_h, avatar_w / orig_w)
+            new_w = int(orig_w * scale)
+            new_h = int(orig_h * scale)
+            avatar_img = avatar_img.resize((new_w, new_h), Image.LANCZOS)
+
+            # Centre-crop to (avatar_w x height)
+            left = (new_w - avatar_w) // 2
+            top  = (new_h - height)   // 2
+            avatar_img = avatar_img.crop((left, top, left + avatar_w, top + height))
+            # Paste at full height — avatar is NOT masked by banner
+            img.paste(avatar_img, (text_w, 0))
+        except Exception:
+            pass
+
+    # ── Bottom banner — LEFT PANEL ONLY ──────────────────────────────────────
+    banner_y = height - banner_h
+    draw.rectangle(
+        [(0, banner_y), (text_w, height)],          # only spans left panel width
+        fill=_parse_hex(bottom_bg_color)
+    )
+
+    # ── Word-wrap helper ─────────────────────────────────────────────────────
+    def _wrap(text: str, font, max_w: int) -> list:
+        words, lines, current = text.split(), [], ""
+        for word in words:
+            test = (current + " " + word).strip()
+            bb = draw.textbbox((0, 0), test, font=font)
+            if bb[2] > max_w and current:
+                lines.append(current)
+                current = word
+            else:
+                current = test
+        if current:
+            lines.append(current)
+        return lines
+
+    def _block_height(lines, font, gap):
+        total = 0
+        for ln in lines:
+            bb = draw.textbbox((0, 0), ln, font=font)
+            total += (bb[3] - bb[1]) + gap
+        return max(0, total - gap)
+
+    # ── Auto-shrink top font until text fits above banner ────────────────────
+    usable_w = text_w - TEXT_PADDING * 2
+    usable_h = text_h - (TEXT_PADDING // 2) - TEXT_PADDING  # top margin halved
+    font_size = top_font_size
+    MIN_FONT  = 28
+
+    while font_size >= MIN_FONT:
+        top_font  = _load_font(font_size)
+        top_lines = _wrap(top_text.upper(), top_font, usable_w)
+        if _block_height(top_lines, top_font, LINE_GAP) <= usable_h:
+            break
+        font_size -= 4
+
+    # ── Draw top text — vertically centred in text_h ─────────────────────────
+    blk_h = _block_height(top_lines, top_font, LINE_GAP)
+    y = (TEXT_PADDING // 2) + ((text_h - (TEXT_PADDING // 2) - TEXT_PADDING - blk_h) // 2)
+
+    for ln in top_lines:
+        bb = draw.textbbox((0, 0), ln, font=top_font)
+        lw, lh = bb[2] - bb[0], bb[3] - bb[1]
+        x = TEXT_PADDING + (usable_w - lw) // 2
+        draw.text((x, y), ln, font=top_font, fill=_parse_hex(top_text_color))
+        y += lh + LINE_GAP
+
+    # ── Bottom banner text — constrained to left panel width, auto-shrink ──────
+    if bottom_text:
+        bot_usable_w  = text_w - TEXT_PADDING * 2
+        bot_usable_h  = banner_h - 12           # small vertical margin
+        bfs           = bottom_font_size
+        BOT_MIN_FONT  = 18
+        BOT_LINE_GAP  = 6
+        while bfs >= BOT_MIN_FONT:
+            bot_font  = _load_font(bfs)
+            bot_lines = _wrap(bottom_text.upper(), bot_font, bot_usable_w)
+            if _block_height(bot_lines, bot_font, BOT_LINE_GAP) <= bot_usable_h:
+                break
+            bfs -= 2
+        bot_blk_h = _block_height(bot_lines, bot_font, BOT_LINE_GAP)
+        BOT_PAD_TOP = 8
+        BOT_PAD_BOT = 24
+        by = banner_y + BOT_PAD_TOP + ((banner_h - BOT_PAD_TOP - BOT_PAD_BOT - bot_blk_h) // 2)
+        for ln in bot_lines:
+            bb  = draw.textbbox((0, 0), ln, font=bot_font)
+            lw, lh = bb[2] - bb[0], bb[3] - bb[1]
+            bx  = TEXT_PADDING + (bot_usable_w - lw) // 2
+            draw.text((bx, by), ln, font=bot_font, fill=_parse_hex(bottom_text_color))
+            by += lh + BOT_LINE_GAP
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read(), "image/png"

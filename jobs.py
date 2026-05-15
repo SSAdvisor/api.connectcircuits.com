@@ -1,12 +1,21 @@
 """
-jobs.py — SQLite-backed async job runner for ConnectCircuits API
+jobs.py — Async job queue and runner for ConnectCircuits API
 
-Job lifecycle:  PENDING → RUNNING → COMPLETE | FAILED
+Job lifecycle:
+  queued → started → complete
+                   → failed
 
-Job state lives in SQLite (store.py). This module provides the async
-execution wrapper, webhook delivery, and background cleanup.
+Architecture:
+  - A single asyncio.Queue (JOB_QUEUE) holds pending job coroutines.
+  - GLOBAL_WORKER_CONCURRENCY worker coroutines drain the queue in parallel.
+  - Workers are started once at app startup via start_queue_workers().
+  - Per-user cap enforced in store.check_user_concurrency() before enqueue.
 
-No Redis dependency.
+Status mapping:
+  "queued"   — accepted by the API, waiting in queue
+  "started"  — dequeued by a worker, actively processing
+  "complete" — finished successfully, result on disk
+  "failed"   — exception raised during processing
 """
 
 import os
@@ -25,16 +34,45 @@ from store import (
     update_job,
     run_cleanup,
     is_safe_webhook_url,
+    get_global_queue_length,
 )
 
 logger = logging.getLogger("jobs")
 
-WEBHOOK_TIMEOUT = float(os.getenv("WEBHOOK_TIMEOUT_SEC", "10"))
-WEBHOOK_RETRIES = int(os.getenv("WEBHOOK_RETRIES", "3"))
+WEBHOOK_TIMEOUT          = float(os.getenv("WEBHOOK_TIMEOUT_SEC",       "10"))
+WEBHOOK_RETRIES          = int(os.getenv("WEBHOOK_RETRIES",              "3"))
+GLOBAL_WORKER_CONCURRENCY = int(os.getenv("GLOBAL_WORKER_CONCURRENCY",  "5"))
 
-# Global worker semaphore — limits total parallel heavy jobs on this node
-GLOBAL_WORKER_CONCURRENCY = int(os.getenv("GLOBAL_WORKER_CONCURRENCY", "5"))
-GLOBAL_WORKER_SEM = asyncio.Semaphore(GLOBAL_WORKER_CONCURRENCY)
+# The central asyncio queue — items are coroutines (async callables)
+JOB_QUEUE: asyncio.Queue = asyncio.Queue()
+
+
+# -------------------------------------------------------
+# Queue workers — started once at app startup
+# -------------------------------------------------------
+
+async def _queue_worker(worker_id: int):
+    """Long-running coroutine that pulls and executes jobs from JOB_QUEUE."""
+    logger.info(f"Queue worker {worker_id} started")
+    while True:
+        job_coro = await JOB_QUEUE.get()
+        try:
+            await job_coro()
+        except Exception as e:
+            logger.exception(f"Worker {worker_id} unhandled exception: {e}")
+        finally:
+            JOB_QUEUE.task_done()
+
+
+def start_queue_workers():
+    """
+    Spawn GLOBAL_WORKER_CONCURRENCY worker coroutines.
+    Call once from app startup — idempotent (checks for existing workers).
+    """
+    loop = asyncio.get_event_loop()
+    for i in range(1, GLOBAL_WORKER_CONCURRENCY + 1):
+        loop.create_task(_queue_worker(i))
+    logger.info(f"Started {GLOBAL_WORKER_CONCURRENCY} queue workers")
 
 
 # -------------------------------------------------------
@@ -43,7 +81,7 @@ GLOBAL_WORKER_SEM = asyncio.Semaphore(GLOBAL_WORKER_CONCURRENCY)
 
 async def _fire_webhook(job_id: str, webhook_url: str, payload: dict):
     if not is_safe_webhook_url(webhook_url):
-        logger.error(f"Webhook URL validation failed for job={job_id}: {webhook_url}")
+        logger.error(f"Webhook URL blocked (SSRF guard) job={job_id}: {webhook_url}")
         return
 
     for attempt in range(1, WEBHOOK_RETRIES + 1):
@@ -51,20 +89,15 @@ async def _fire_webhook(job_id: str, webhook_url: str, payload: dict):
             async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
                 resp = await client.post(webhook_url, json=payload)
                 if resp.status_code < 400:
-                    logger.info(
-                        f"Webhook delivered job={job_id} "
-                        f"attempt={attempt} status={resp.status_code}"
-                    )
+                    logger.info(f"Webhook delivered job={job_id} attempt={attempt} status={resp.status_code}")
                     return
-                logger.warning(
-                    f"Webhook job={job_id} attempt={attempt} HTTP {resp.status_code}"
-                )
+                logger.warning(f"Webhook job={job_id} attempt={attempt} HTTP {resp.status_code}")
         except Exception as e:
             logger.warning(f"Webhook job={job_id} attempt={attempt} error: {e}")
         if attempt < WEBHOOK_RETRIES:
-            await asyncio.sleep(2 ** attempt)  # exponential back-off: 2s, 4s
+            await asyncio.sleep(2 ** attempt)   # 2s, 4s back-off
 
-    logger.error(f"Webhook FAILED for job={job_id} after {WEBHOOK_RETRIES} attempts")
+    logger.error(f"Webhook FAILED job={job_id} after {WEBHOOK_RETRIES} attempts")
 
 
 # -------------------------------------------------------
@@ -72,7 +105,7 @@ async def _fire_webhook(job_id: str, webhook_url: str, payload: dict):
 # -------------------------------------------------------
 
 async def periodic_cleanup(interval_sec: int = 3600):
-    """Run cleanup tasks periodically. Spawn as a background task."""
+    """Background task — runs cleanup once per hour."""
     while True:
         try:
             results = run_cleanup()
@@ -80,15 +113,15 @@ async def periodic_cleanup(interval_sec: int = 3600):
             if parts:
                 logger.info(f"Cleanup: {', '.join(parts)}")
         except Exception as e:
-            logger.exception(f"Cleanup task error: {e}")
+            logger.exception(f"Cleanup error: {e}")
         await asyncio.sleep(interval_sec)
 
 
 # -------------------------------------------------------
-# Job runner — wraps any async task function
+# Job enqueue — called by every endpoint
 # -------------------------------------------------------
 
-async def run_job(
+async def enqueue_job(
     job_id: str,
     user_key_hash: str,
     raw_key: str,
@@ -98,22 +131,33 @@ async def run_job(
     public_base_url: str,
 ):
     """
-    Execute task_fn() under the global semaphore.
+    Build the job execution coroutine and push it onto JOB_QUEUE.
+    The caller already wrote the job to SQLite with status='queued'.
 
-    task_fn must return (bytes, content_type, extra_headers_dict).
-
-    On completion:
-      - Saves result to disk
-      - Updates job status in SQLite
-      - Fires webhook if configured
-      - Logs usage
+    The coroutine will:
+      1. Set status → 'started'
+      2. Call task_fn()  →  (bytes, content_type, headers)
+      3. Save result, set status → 'complete', fire webhook
+      On exception: set status → 'failed', fire webhook
     """
-    job = get_job(job_id)
-    webhook_url = (job.get("webhook_url") if job else "") or ""
+    queue_pos = get_global_queue_length()   # approximate position for logging
+    logger.info(f"Job {job_id} queued at position ~{queue_pos} endpoint={endpoint}")
 
-    async with GLOBAL_WORKER_SEM:
-        update_job(job_id, status="running", started_at=int(time.time()))
-        log_usage(raw_key, endpoint, job_id, "running")
+    # Log the initial queued event
+    log_usage(raw_key, endpoint, job_id, "queued")
+
+    async def _execute():
+        job = get_job(job_id)
+        if not job:
+            logger.error(f"Job {job_id} disappeared before execution")
+            return
+
+        webhook_url = (job.get("webhook_url") or "").strip()
+
+        # ── Mark as started ─────────────────────────────────────────────────
+        update_job(job_id, status="started", started_at=int(time.time()))
+        log_usage(raw_key, endpoint, job_id, "started")
+        logger.info(f"Job {job_id} started endpoint={endpoint}")
 
         try:
             result_bytes, content_type, extra_headers = await task_fn()
@@ -124,42 +168,49 @@ async def run_job(
 
             update_job(
                 job_id,
-                status="complete",
-                completed_at=now,
-                result_url=result_url,
-                result_headers=json.dumps(extra_headers),
+                status       = "complete",
+                completed_at = now,
+                result_url   = result_url,
+                result_headers = json.dumps(extra_headers),
             )
             log_usage(raw_key, endpoint, job_id, "complete")
+            logger.info(f"Job {job_id} complete endpoint={endpoint}")
 
             if webhook_url:
-                webhook_payload = {
+                asyncio.create_task(_fire_webhook(job_id, webhook_url, {
                     "job_id":       job_id,
                     "status":       "complete",
                     "endpoint":     endpoint,
                     "result_url":   result_url,
                     "completed_at": now,
                     "headers":      extra_headers,
-                }
-                asyncio.create_task(
-                    _fire_webhook(job_id, webhook_url, webhook_payload)
-                )
+                }))
 
         except Exception as exc:
             logger.exception(f"Job {job_id} failed: {exc}")
             update_job(
                 job_id,
-                status="failed",
-                completed_at=int(time.time()),
-                error=str(exc)[:500],
+                status       = "failed",
+                completed_at = int(time.time()),
+                error        = str(exc)[:500],
             )
             log_usage(raw_key, endpoint, job_id, "failed")
 
             if webhook_url:
-                asyncio.create_task(
-                    _fire_webhook(job_id, webhook_url, {
-                        "job_id":   job_id,
-                        "status":   "failed",
-                        "endpoint": endpoint,
-                        "error":    str(exc)[:500],
-                    })
-                )
+                asyncio.create_task(_fire_webhook(job_id, webhook_url, {
+                    "job_id":   job_id,
+                    "status":   "failed",
+                    "endpoint": endpoint,
+                    "error":    str(exc)[:500],
+                }))
+
+    await JOB_QUEUE.put(_execute)
+
+
+# -------------------------------------------------------
+# Queue depth helper — exposed to status endpoints
+# -------------------------------------------------------
+
+def get_queue_depth() -> int:
+    """Return the number of jobs currently waiting in the asyncio queue."""
+    return JOB_QUEUE.qsize()
