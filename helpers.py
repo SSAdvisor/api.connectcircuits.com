@@ -701,7 +701,7 @@ async def generate_text_thumbnail(
     top_text_color: str = "#ffffff",
     bottom_bg_color: str = "#FFD700",
     bottom_text_color: str = "#000000",
-    top_font_size: int = 95,
+    top_font_size: int = 89,
     bottom_font_size: int = 44,
     font_path: Optional[str] = None,
 ) -> tuple:
@@ -846,7 +846,7 @@ async def generate_text_thumbnail(
             bfs -= 2
         bot_blk_h = _block_height(bot_lines, bot_font, BOT_LINE_GAP)
         BOT_PAD_TOP = 8
-        BOT_PAD_BOT = 14
+        BOT_PAD_BOT = 24
         by = banner_y + BOT_PAD_TOP + ((banner_h - BOT_PAD_TOP - BOT_PAD_BOT - bot_blk_h) // 2)
         for ln in bot_lines:
             bb  = draw.textbbox((0, 0), ln, font=bot_font)
