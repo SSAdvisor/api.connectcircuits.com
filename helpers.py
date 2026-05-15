@@ -248,6 +248,20 @@ def probe_video_dimensions(video_path: str) -> tuple:
         return 640, 360
 
 
+def get_video_format_dimensions(video_format: str | None) -> tuple[int, int, str]:
+    fmt = (video_format or "full").strip().lower()
+    if fmt in ("short", "shorts", "vertical", "portrait"):
+        return 720, 1280, "shorts"
+    return 1280, 720, "full"
+
+
+def build_cover_scale_crop_filter(target_w: int, target_h: int) -> str:
+    return (
+        f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
+        f"crop={target_w}:{target_h}"
+    )
+
+
 # -------------------------------------------------------
 # Overlay caption filtergraph
 # -------------------------------------------------------
@@ -283,39 +297,48 @@ def wrap_text_to_lines(text, max_chars_per_line):
 
 
 def build_overlay_filtergraph(timed_segments, font_size, overlay_bar_color, text_color, video_width, video_height):
-    def esc(s):
+    def esc(s: str) -> str:
         return (
             s.replace("\\", "\\\\")
-             .replace("'", "\u2019")
-             .replace(":", "\\:")
-             .replace(",", "\\,")
-             .replace("[", "\\[")
-             .replace("]", "\\]")
+             .replace("'", "’")
+             .replace(":", "\:")
+             .replace(",", "\,")
+             .replace("[", "\[")
+             .replace("]", "\]")
         )
 
-    bar_thickness = max(4, font_size // 6)
-    line_height   = int(font_size * 1.4)
-    v_padding     = int(font_size * 0.35)
-    font_path     = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-    vid_center_y  = video_height // 2
-    max_chars     = compute_max_chars_per_line(font_size, video_width)
-    parts         = []
+    font_size = int(font_size or 52)
+    bar_thickness = max(4, int(video_height * 0.008))
+    line_height = int(font_size * 1.32)
+    v_padding = max(12, int(video_height * 0.03))
+    font_path = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    vid_center_y = video_height // 2
+    max_chars = compute_max_chars_per_line(font_size, video_width, usable_fraction=0.82)
+    parts = []
 
     for seg in timed_segments:
         lines = wrap_text_to_lines(seg["text"], max_chars_per_line=max_chars)
-        n_lines         = len(lines)
+        n_lines = len(lines)
         rendered_height = (n_lines - 1) * line_height + font_size
-        block_top_y     = vid_center_y - (rendered_height // 2)
-        block_bot_y     = block_top_y + rendered_height
-        box_y           = max(0, block_top_y - v_padding)
-        box_h           = rendered_height + v_padding * 2
-        bar_top_y       = max(0, box_y - bar_thickness)
-        bar_bot_y       = min(video_height - bar_thickness, block_bot_y + v_padding)
-        enable_expr     = f"between(t\\,{seg['start']:.3f}\\,{seg['end']:.3f})"
+        block_top_y = vid_center_y - (rendered_height // 2)
+        box_y = max(0, block_top_y - v_padding)
+        box_h = min(video_height - box_y, rendered_height + v_padding * 2)
+        bar_top_y = max(0, box_y - bar_thickness)
+        bar_bot_y = min(video_height - bar_thickness, box_y + box_h)
+        enable_expr = f"between(t\,{seg['start']:.3f}\,{seg['end']:.3f})"
 
-        parts.append(f"drawbox=x=0:y={box_y}:w=iw:h={box_h}:color=black@0.55:t=fill:enable='{enable_expr}'")
-        parts.append(f"drawbox=x=0:y={bar_top_y}:w=iw:h={bar_thickness}:color={overlay_bar_color}@1.0:t=fill:enable='{enable_expr}'")
-        parts.append(f"drawbox=x=0:y={bar_bot_y}:w=iw:h={bar_thickness}:color={overlay_bar_color}@1.0:t=fill:enable='{enable_expr}'")
+        parts.append(
+            f"drawbox=x=0:y={box_y}:w={video_width}:h={box_h}:"
+            f"color=black@0.55:t=fill:enable='{enable_expr}'"
+        )
+        parts.append(
+            f"drawbox=x=0:y={bar_top_y}:w={video_width}:h={bar_thickness}:"
+            f"color={overlay_bar_color}@1.0:t=fill:enable='{enable_expr}'"
+        )
+        parts.append(
+            f"drawbox=x=0:y={bar_bot_y}:w={video_width}:h={bar_thickness}:"
+            f"color={overlay_bar_color}@1.0:t=fill:enable='{enable_expr}'"
+        )
 
         for li, line_text in enumerate(lines):
             y_px = block_top_y + (li * line_height)

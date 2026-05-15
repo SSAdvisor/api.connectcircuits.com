@@ -37,6 +37,8 @@ from helpers import (
     chunk_text,
     generate_srt_from_whisper,
     build_overlay_filtergraph,
+    build_cover_scale_crop_filter,
+    get_video_format_dimensions,
     generate_overlay_timed_segments,
     build_timed_segments_from_audio_chunks,
     build_timed_segments_from_audio_file,
@@ -254,6 +256,7 @@ class VideoGenerateRequest(AsyncBase):
     words_per_line: Optional[int] = 5
     overlay_bar_color: Optional[str] = "yellow"
     words_per_caption: Optional[int] = 12
+    video_format: Optional[str] = "full"
 
 
 class VideoCaptionRequest(AsyncBase):
@@ -668,26 +671,32 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
 
             loop       = asyncio.get_event_loop()
             loop_flags = ["-stream_loop", "-1"] if request.loop_video else []
+            target_w, target_h, resolved_format = get_video_format_dimensions(request.video_format)
+            base_vf = build_cover_scale_crop_filter(target_w, target_h)
 
             if not do_captions:
                 cmd = [
                     "ffmpeg", "-y", *loop_flags, "-i", video_path, "-i", audio_path,
-                    "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                    "-vf", base_vf,
+                    "-map", "0:v", "-map", "1:a",
+                    "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-shortest", output_path,
                 ]
             elif caption_style == "overlay":
-                video_width, video_height = probe_video_dimensions(video_path)
+                overlay_font_size = request.font_size or (64 if resolved_format == "shorts" else 52)
                 timed_segments = await _resolve_timed_segments(
                     request.caption_text, chunk_paths, audio_path,
                     video_path, request.words_per_caption or 12, loop,
                 )
                 if not timed_segments:
                     raise RuntimeError("No caption segments could be generated.")
-                filtergraph = build_overlay_filtergraph(
-                    timed_segments, request.font_size or 52,
+                overlay_fg = build_overlay_filtergraph(
+                    timed_segments, overlay_font_size,
                     request.overlay_bar_color or "yellow",
-                    request.font_color or "white", video_width, video_height,
+                    request.font_color or "white", target_w, target_h,
                 )
+                filtergraph = f"{base_vf},{overlay_fg}"
                 with open(fg_path, "w", encoding="utf-8") as f:
                     f.write(filtergraph)
                 cmd = [
@@ -695,6 +704,7 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
                     "-filter_script:v", fg_path,
                     "-map", "0:v", "-map", "1:a",
                     "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-shortest", output_path,
                 ]
             else:
@@ -706,16 +716,19 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
                     raise RuntimeError("No speech detected in video.")
                 with open(srt_path, "w", encoding="utf-8") as f:
                     f.write(srt_content)
-                vf = _build_subtitle_vf(
+                subtitle_font_size = request.font_size or (24 if resolved_format == "shorts" else 18)
+                subtitle_vf = _build_subtitle_vf(
                     srt_path, request.font_color or "white",
                     request.outline_color or "black",
-                    request.font_size or 18, request.position or "bottom",
+                    subtitle_font_size, request.position or "bottom",
                 )
+                vf = f"{base_vf},{subtitle_vf}"
                 cmd = [
                     "ffmpeg", "-y", *loop_flags, "-i", video_path, "-i", audio_path,
                     "-vf", vf,
                     "-map", "0:v", "-map", "1:a",
                     "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "192k", "-shortest", output_path,
                 ]
 
@@ -732,6 +745,9 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
             return video_bytes, "video/mp4", {
                 "X-Caption-Style": caption_style if do_captions else "none",
                 "X-Timing-Method": _timing_method_label(chunk_paths, audio_path, do_captions, request.caption_text),
+                "X-Video-Format": resolved_format,
+                "X-Width": str(target_w),
+                "X-Height": str(target_h),
             }
         finally:
             for p in [video_path, audio_path, output_path, srt_path, fg_path] + chunk_paths:
