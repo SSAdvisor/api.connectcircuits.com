@@ -69,7 +69,7 @@ def start_queue_workers():
     Spawn GLOBAL_WORKER_CONCURRENCY worker coroutines.
     Call once from app startup — idempotent (checks for existing workers).
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for i in range(1, GLOBAL_WORKER_CONCURRENCY + 1):
         loop.create_task(_queue_worker(i))
     logger.info(f"Started {GLOBAL_WORKER_CONCURRENCY} queue workers")
