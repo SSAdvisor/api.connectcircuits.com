@@ -288,7 +288,7 @@ def create_job(
         """INSERT INTO jobs
            (job_id, endpoint, user_key_hash, webhook_url, status,
             created_at, result_headers, request_meta)
-           VALUES (?, ?, ?, ?, 'pending', ?, '{}', ?)""",
+           VALUES (?, ?, ?, ?, 'queued', ?, '{}', ?)""",
         (job_id, endpoint, user_key_hash, webhook_url or "", now, request_meta),
     )
     conn.commit()

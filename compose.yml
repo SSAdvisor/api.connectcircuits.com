@@ -10,7 +10,7 @@ services:
       - PYTHONUNBUFFERED=1
 
   # ── ConnectCircuits TTS/media API ─────────────────────────────────────────
-  tts-api:
+  api:
     build:
       context: ./
       dockerfile: Dockerfile
