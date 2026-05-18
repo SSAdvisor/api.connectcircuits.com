@@ -7,6 +7,11 @@ import httpx
 import logging
 
 from fastapi import FastAPI, HTTPException, Security, Header
+from fastapi.openapi.docs import (
+    get_redoc_html,
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -81,6 +86,8 @@ Every generation endpoint returns **HTTP 202** immediately with a `job_id`.
     version="2.0.0",
     contact={"name": "ConnectCircuits", "url": "https://connectcircuits.com"},
     license_info={"name": "Proprietary"},
+    docs_url=None,
+    redoc_url=None,
     openapi_tags=[
         {"name": "Health", "description": "Service health check."},
         {"name": "Audio", "description": "Text-to-speech audio generation via Kokoro TTS."},
@@ -92,6 +99,31 @@ Every generation endpoint returns **HTTP 202** immediately with a `job_id`.
     ],
 )
 app.include_router(admin_router)
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js",
+        swagger_css_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css",
+    )
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect():
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_html():
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url="https://unpkg.com/redoc@2/bundles/redoc.standalone.js",
+    )
 
 KOKORO_BASE_URL  = os.getenv("KOKORO_BASE_URL", "http://kokoro:8880")
 FAL_API_KEY      = os.getenv("FAL_API_KEY")
