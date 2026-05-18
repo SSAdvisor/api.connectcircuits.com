@@ -56,8 +56,40 @@ logger = logging.getLogger("main")
 
 app = FastAPI(
     title="ConnectCircuits API",
-    description="ConnectCircuits multi-purpose media generation API",
+    description="""
+## ConnectCircuits Media Generation API
+
+A self-hosted async media generation platform for audio synthesis, image generation,
+video overlay, and slideshow creation.
+
+### Authentication
+All endpoints require an API key in the `x-api-key` header.
+
+### Async Job Pattern
+Every generation endpoint returns **HTTP 202** immediately with a `job_id`.
+- **Poll**: `GET /v1/jobs/{job_id}` → `GET /v1/jobs/{job_id}/result`
+- **Webhook**: pass `webhook_url` in the request body; the API will POST results to you automatically.
+
+### Job Statuses
+| Status | Meaning |
+|--------|---------|
+| `queued` | Waiting for a worker |
+| `started` | Actively processing |
+| `complete` | Result ready at `result_url` |
+| `failed` | Error — see `error` field |
+""",
     version="2.0.0",
+    contact={"name": "ConnectCircuits", "url": "https://connectcircuits.com"},
+    license_info={"name": "Proprietary"},
+    openapi_tags=[
+        {"name": "Health", "description": "Service health check."},
+        {"name": "Audio", "description": "Text-to-speech audio generation via Kokoro TTS."},
+        {"name": "Image", "description": "AI image generation via FLUX (fal.ai / Together AI)."},
+        {"name": "Video", "description": "Video compositing, overlay captions, and caption-only processing."},
+        {"name": "Slideshow", "description": "Narrated slideshow video generation from image+text slides."},
+        {"name": "Jobs", "description": "Async job status polling and result download."},
+        {"name": "Admin", "description": "API key management and usage reporting (requires admin secret)."},
+    ],
 )
 app.include_router(admin_router)
 
@@ -173,7 +205,7 @@ async def _guard_concurrency(raw_key: str, endpoint: str):
 # Job status + result endpoints
 # -------------------------------------------------------
 
-@app.get("/v1/jobs/{job_id}")
+@app.get("/v1/jobs/{job_id}", tags=["Jobs"], summary="Get job status")
 async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
     key_hash = _hash_key(raw_key)
     job = get_job_by_user(job_id, key_hash)
@@ -197,7 +229,7 @@ async def job_status(job_id: str, raw_key: str = Security(verify_api_key)):
     }
 
 
-@app.get("/v1/jobs/{job_id}/result")
+@app.get("/v1/jobs/{job_id}/result", tags=["Jobs"], summary="Download job result")
 async def job_result(job_id: str, raw_key: str = Security(verify_api_key)):
     key_hash = _hash_key(raw_key)
     job = get_job_by_user(job_id, key_hash)
@@ -236,10 +268,10 @@ class AsyncBase(BaseModel):
 
 
 class AudioGenerateRequest(AsyncBase):
-    text: str
-    voice: Optional[str] = "af_bella"
-    speed: Optional[float] = 1.0
-    response_format: Optional[str] = "mp3"
+    text: str = Field(..., description="Text to synthesize. Automatically chunked for long inputs.")
+    voice: Optional[str] = Field("af_bella", description="Kokoro voice ID. See GET /v1/generate/audio/voices.")
+    speed: Optional[float] = Field(1.0, description="Playback speed multiplier (0.5 – 2.0).")
+    response_format: Optional[str] = Field("mp3", description="Output format: mp3, wav, opus, or flac.")
 
 
 class VideoGenerateRequest(AsyncBase):
@@ -256,7 +288,7 @@ class VideoGenerateRequest(AsyncBase):
     words_per_line: Optional[int] = 5
     overlay_bar_color: Optional[str] = "yellow"
     words_per_caption: Optional[int] = 12
-    video_format: Optional[str] = "full"
+    video_format: Optional[str] = Field("full", description="Output format: 'full' → 1280×720, 'shorts'/'vertical'/'portrait' → 720×1280.")
 
 
 class VideoCaptionRequest(AsyncBase):
@@ -322,8 +354,9 @@ class SlideshowRequest(AsyncBase):
 # Health
 # -------------------------------------------------------
 
-@app.get("/health")
+@app.get("/health", tags=["Health"], summary="Service health check")
 async def health():
+    """Returns API and dependency health. No authentication required."""
     try:
         conn = _get_db()
         conn.execute("SELECT 1")
@@ -346,7 +379,7 @@ async def health():
 # POST /v1/generate/audio
 # -------------------------------------------------------
 
-@app.post("/v1/generate/audio", status_code=202)
+@app.post("/v1/generate/audio", status_code=202, tags=["Audio"], summary="Generate speech audio from text")
 async def generate_audio(request: AudioGenerateRequest, raw_key: str = Security(verify_api_key)):
     key_hash = await _guard_concurrency(raw_key, "/v1/generate/audio")
 
@@ -419,7 +452,7 @@ async def generate_audio(request: AudioGenerateRequest, raw_key: str = Security(
     return _job_response(job_id, request.webhook_url)
 
 
-@app.get("/v1/generate/audio/voices")
+@app.get("/v1/generate/audio/voices", tags=["Audio"], summary="List available TTS voices")
 async def list_voices(raw_key: str = Security(verify_api_key)):
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -434,7 +467,7 @@ async def list_voices(raw_key: str = Security(verify_api_key)):
 # POST /v1/generate/image
 # -------------------------------------------------------
 
-@app.post("/v1/generate/image", status_code=202)
+@app.post("/v1/generate/image", status_code=202, tags=["Image"], summary="Generate an image from a text prompt")
 async def generate_image(request: ImageGenerateRequest, raw_key: str = Security(verify_api_key)):
     key_hash = await _guard_concurrency(raw_key, "/v1/generate/image")
     if request.width % 16 != 0 or request.height % 16 != 0:
@@ -491,7 +524,7 @@ async def generate_image(request: ImageGenerateRequest, raw_key: str = Security(
 # POST /v1/generate/text-thumbnail
 # -------------------------------------------------------
 
-@app.post("/v1/generate/text-thumbnail", status_code=202)
+@app.post("/v1/generate/text-thumbnail", status_code=202, tags=["Image"], summary="Generate a styled text thumbnail image")
 async def generate_text_thumbnail_endpoint(
     request: TextThumbnailRequest,
     raw_key: str = Security(verify_api_key),
@@ -533,7 +566,7 @@ async def generate_text_thumbnail_endpoint(
 # POST /v1/generate/slideshow
 # -------------------------------------------------------
 
-@app.post("/v1/generate/slideshow", status_code=202)
+@app.post("/v1/generate/slideshow", status_code=202, tags=["Slideshow"], summary="Generate a narrated slideshow video")
 async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(verify_api_key)):
     if not request.slides:
         raise HTTPException(status_code=400, detail="slides array is empty.")
@@ -633,7 +666,7 @@ async def generate_slideshow(request: SlideshowRequest, raw_key: str = Security(
 # POST /v1/generate/video
 # -------------------------------------------------------
 
-@app.post("/v1/generate/video", status_code=202)
+@app.post("/v1/generate/video", status_code=202, tags=["Video"], summary="Combine video + audio with optional captions")
 async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(verify_api_key)):
     key_hash      = await _guard_concurrency(raw_key, "/v1/generate/video")
     do_captions   = bool(request.caption_text or request.audio_chunk_urls)
@@ -772,7 +805,7 @@ async def generate_video(request: VideoGenerateRequest, raw_key: str = Security(
 # POST /v1/generate/video/captions
 # -------------------------------------------------------
 
-@app.post("/v1/generate/video/captions", status_code=202)
+@app.post("/v1/generate/video/captions", status_code=202, tags=["Video"], summary="Add captions to an existing video")
 async def generate_video_captions(request: VideoCaptionRequest, raw_key: str = Security(verify_api_key)):
     key_hash = await _guard_concurrency(raw_key, "/v1/generate/video/captions")
     style    = (request.style or "subtitle").lower().strip()
